@@ -123,3 +123,24 @@ CVaR is the average loss in the worst $1 - \alpha$ fraction of cases:
 
 
 [Rockafellar and Uryasev](https://sites.math.washington.edu/~rtr/papers/rtr179-CVaR1.pdf) showed that CVaR can be expressed as a convex optimization problem, in fact as a linear program, making it easy to solve and computationally tractable.
+
+## Accelerated Solver (CVXPYgen)
+
+The CVaR optimizer can optionally run a [CVXPYgen](https://github.com/cvxgrp/cvxpygen)-generated C solver (`fast_cvar.py`) instead of the pure-Python CVXPY path. It produces bit-identical weights at roughly 2x faster end-to-end (~6x per solve), which matters across a long backtest where the optimizer is called on every rebalance.
+
+To use it, just add the `--fast` flag:
+
+```bash
+python cvar_trader.py --backtest --fast
+```
+
+The first run **generates and compiles** the C extension for the current problem size (number of assets `N` and return-window length `T`), which takes ~25 s. Compiled solvers are cached on disk as `enhanced_cvar_code_<N>_<T>/`, so every subsequent run with the same dimensions skips compilation and is fast immediately. If the solver fails to build or load for any reason, the code automatically falls back to the standard CVXPY path — `--fast` never breaks a run.
+
+**Requirements:** a C compiler must be on `PATH` (this repo was built with mingw64 gcc; MSVC also works). On machines with a global `user = true` pip config, set `PIP_USER=0` before running so CVXPYgen's `pip --target` build step doesn't conflict (`fast_cvar.py` already sets this around code generation, but exporting it yourself avoids edge cases):
+
+```bash
+# PowerShell
+$env:PIP_USER = "0"; python cvar_trader.py --backtest --fast
+```
+
+The generated `enhanced_cvar_code_*/` directories are build artifacts and are git-ignored; delete them anytime to force a clean re-compile.
