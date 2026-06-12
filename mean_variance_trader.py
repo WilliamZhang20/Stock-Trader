@@ -24,13 +24,14 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
-UNIVERSE = ["SPY", "QQQ", "IWM", "GOOGL", "EEM", "NVDA", "LQD", "MU", "MSFT", "TSM", "DIA"]
+from market_analyzer import build_universe, select_universe
+
 START = "2023-01-01"
 END   = None
 REBAL_FREQ = "B" # Daily
 RETURN_LOOKBACK_DAYS = 100
 EWMA_HALFLIFE_DAYS = 5
-LAMBDA_RISK = 7.0 # Reduced base risk aversion for more aggressive allocation
+LAMBDA_RISK = 7.0
 GAMMA_TC = 0.001
 TAU_TURNOVER = 0.40
 W_MAX = 0.40 # Slightly relaxed max weight
@@ -261,6 +262,68 @@ def walk_forward_backtest(px):
     weights_panel = pd.DataFrame(weights_record).T.reindex(curve.index).ffill().fillna(0.0)
     return curve, weights_panel
 
+
+def walk_forward_backtest_dynamic(
+    pool_px,
+    target_size=9,
+    universe_refresh_days=63,
+    select_lookback=378,
+    select_kwargs=None,
+    lambda_risk=LAMBDA_RISK,
+):
+    """
+    Mean-variance walk-forward backtest with a ROLLING universe.
+
+    Every `universe_refresh_days`, the candidate pool is re-surveyed (using only
+    past data) so the portfolio rotates into newly-leading assets; with adaptive
+    `select_kwargs` the per-cluster slot weighting re-adapts to recent performance
+    at each refresh. Uses a static risk-aversion (no HMM) for simplicity.
+
+    Returns (curve, weights, universe_log).
+    """
+    select_kwargs = dict(select_kwargs or {})
+    rets = pool_px.pct_change().dropna()
+    dates = rets.index
+
+    w = pd.Series(0.0, index=pool_px.columns)
+    universe = None
+    last_uni_refresh = -10 ** 9
+    equity = 1.0
+    equity_curve = []
+    weights_record = {}
+    universe_log = {}
+
+    for t_idx, today in enumerate(dates):
+        if t_idx >= RETURN_LOOKBACK_DAYS:
+            if universe is None or (t_idx - last_uni_refresh) >= universe_refresh_days:
+                hist = rets.iloc[max(0, t_idx - select_lookback):t_idx]
+                try:
+                    new_universe = select_universe(hist, target_size=target_size, **select_kwargs)
+                except Exception as e:
+                    print(f"Universe selection failed at {today.date()}: {e}")
+                    new_universe = universe
+                if new_universe and new_universe != universe:
+                    universe = new_universe
+                    universe_log[today] = list(universe)
+                last_uni_refresh = t_idx
+
+            window = rets.iloc[t_idx - RETURN_LOOKBACK_DAYS:t_idx][universe]
+            mu = exp_weighted_mean_returns(window, EWMA_HALFLIFE_DAYS)
+            Sigma = shrinkage_cov(window)
+            cur = solve_portfolio(mu, Sigma, w_prev=w[universe].values, lambda_risk=lambda_risk)
+
+            w = pd.Series(0.0, index=pool_px.columns)
+            w[universe] = cur.values
+            weights_record[today] = w.copy()
+
+        if t_idx > 0 and w.sum() > 0:
+            equity *= 1.0 + float((rets.iloc[t_idx] * w).sum())
+        equity_curve.append((today, equity))
+
+    curve = pd.Series(dict(equity_curve)).sort_index().rename("Equity")
+    weights_panel = pd.DataFrame(weights_record).T.reindex(curve.index).ffill().fillna(0.0)
+    return curve, weights_panel, universe_log
+
 # -----------------------
 # CLI
 # -----------------------
@@ -269,9 +332,24 @@ def main():
     parser.add_argument("--backtest", action="store_true")
     parser.add_argument("--paper", action="store_true")
     parser.add_argument("--notional", type=float, default=10000.0)
+    parser.add_argument("--universe-size", type=int, default=9, help="Number of assets to select (default: 9)")
+    parser.add_argument(
+        "--universe-criterion", default="sharpe", choices=["sharpe", "calmar", "centroid"],
+        help="Selection criterion within each cluster (default: sharpe)"
+    )
     args = parser.parse_args()
 
-    px = fetch_alpaca_prices(UNIVERSE, start=START, end=END)
+    universe_end = START if args.backtest else None
+    print(f"Selecting universe (size={args.universe_size}, criterion={args.universe_criterion})...")
+    universe = build_universe(
+        target_size=args.universe_size,
+        criterion=args.universe_criterion,
+        end_date=universe_end,
+        verbose=True,
+    )
+    print()
+
+    px = fetch_alpaca_prices(universe, start=START, end=END)
 
     if args.backtest:
         curve, weights = walk_forward_backtest(px)
@@ -279,7 +357,11 @@ def main():
         daily_rets = curve.pct_change().dropna()
         ann_vol = daily_rets.std() * np.sqrt(252)
         sharpe = ann_ret / ann_vol if ann_vol > 0 else np.nan
-        print(f"Backtest: Return {ann_ret:.2%}, Volatility {ann_vol:.2%}, Sharpe {sharpe:.2f}")
+        # Maximum drawdown (peak-to-trough)
+        running_max = curve.cummax()
+        drawdown = (curve - running_max) / running_max
+        max_drawdown = drawdown.min()
+        print(f"Backtest: Return {ann_ret:.2%}, Volatility {ann_vol:.2%}, Sharpe {sharpe:.2f}, Max Drawdown {max_drawdown:.2%}")
 
     if args.paper:
         key = os.environ["APCA_API_KEY_ID"]
@@ -287,8 +369,8 @@ def main():
         trading_client = TradingClient(key, secret, paper=True)
         account = trading_client.get_account()
         equity = float(account.equity)
-        current_positions = {p.symbol: float(p.market_value) for p in trading_client.get_all_positions() if p.symbol in UNIVERSE}
-        current_w = pd.Series({sym: current_positions.get(sym, 0.0) / equity for sym in UNIVERSE}) if equity > 0 else pd.Series(0.0, index=UNIVERSE)
+        current_positions = {p.symbol: float(p.market_value) for p in trading_client.get_all_positions() if p.symbol in universe}
+        current_w = pd.Series({sym: current_positions.get(sym, 0.0) / equity for sym in universe}) if equity > 0 else pd.Series(0.0, index=universe)
         
         rets = px.pct_change().dropna()
         window = rets.tail(RETURN_LOOKBACK_DAYS)

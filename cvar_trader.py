@@ -12,12 +12,18 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
+from market_analyzer import build_universe, select_universe
+import fast_cvar
+
 # =====================
 # CONFIG
 # =====================
-UNIVERSE = ["SPY", "CAT", "GOOGL", "MU", "TSM", "SLV", "GLD", "ITA"]
 START = "2022-01-01"
 END   = None
+
+# When True, use the CVXPYgen-compiled solver (fast_cvar.py) for a ~6x speedup,
+# falling back to plain CVXPY automatically if compilation is unavailable.
+USE_FAST_SOLVER = False
 
 REBALANCE_FREQ_DAYS = 1
 LOOKBACK_DAYS = 252
@@ -248,7 +254,22 @@ def solve_enhanced_cvar_portfolio(
     momentum_window = min(63, T // 4)
     recent_cum_ret = np.sum(R[-momentum_window:], axis=0)
     momentum_score = recent_cum_ret @ w
-    
+
+    # =========================
+    # Fast path: CVXPYgen-compiled solver (identical formulation)
+    # =========================
+    # The two regime-scaled linear terms fold into a single coefficient so the
+    # compiled problem stays DPP-compliant (no parameter*parameter products).
+    if USE_FAST_SOLVER and w_prev is not None:
+        lin = lambda_ret * weighted_mean + lambda_momentum * recent_cum_ret
+        w_fast = fast_cvar.solve(
+            R, lin, lambda_cvar, lambda_turnover, w_prev, alpha=confidence
+        )
+        if w_fast is not None:
+            w_opt = np.clip(w_fast, 0, MAX_WEIGHT)
+            w_opt[w_opt < MIN_WEIGHT_THRESHOLD] = 0.0
+            return pd.Series(w_opt, index=returns.columns)
+
     # =========================
     # Turnover penalty
     # =========================
@@ -377,6 +398,105 @@ def walk_forward_backtest(px):
     weights = pd.DataFrame(weights_record).T.reindex(curve.index).ffill().fillna(0.0)
     return curve, weights
 
+
+def walk_forward_backtest_dynamic(
+    pool_px,
+    target_size=8,
+    universe_refresh_days=63,
+    select_lookback=378,
+    select_kwargs=None,
+):
+    """
+    Walk-forward CVaR backtest with a ROLLING universe.
+
+    Instead of a fixed universe, the candidate pool is re-surveyed every
+    `universe_refresh_days` using only data available up to that day, so the
+    portfolio rotates into newly-leading assets. When `select_kwargs` requests
+    adaptive allocation, the per-cluster slot weighting is itself re-derived from
+    recent performance at each refresh — i.e. the cluster weighting adapts too.
+
+    Parameters
+    ----------
+    pool_px               : price panel for the full candidate pool (clean, no NaN)
+    target_size           : number of assets held at any time
+    universe_refresh_days : trading days between universe re-selections (63 ≈ quarterly)
+    select_lookback       : trailing days fed to the universe selector
+    select_kwargs         : extra kwargs for market_analyzer.select_universe
+                            (e.g. allocation="adaptive", criterion="sharpe")
+
+    Returns (curve, weights, universe_log) where universe_log maps each refresh
+    date to the chosen universe.
+    """
+    select_kwargs = dict(select_kwargs or {})
+    rets = pool_px.pct_change().dropna()
+    dates = rets.index
+
+    last_rebalance = -1
+    prev_regime = None
+    lambdas = get_lambdas("neutral")
+
+    w = pd.Series(0.0, index=pool_px.columns)
+    universe = None
+    last_uni_refresh = -10 ** 9
+    equity = 1.0
+    curve = []
+    weights_record = {}
+    universe_log = {}
+
+    for t, day in enumerate(dates):
+        if t >= LOOKBACK_DAYS:
+            # ---- periodically re-select the universe from PAST data only ----
+            if universe is None or (t - last_uni_refresh) >= universe_refresh_days:
+                hist = rets.iloc[max(0, t - select_lookback):t]
+                try:
+                    new_universe = select_universe(hist, target_size=target_size, **select_kwargs)
+                except Exception as e:
+                    print(f"Universe selection failed at {day.date()}: {e}")
+                    new_universe = universe
+                if new_universe and new_universe != universe:
+                    universe = new_universe
+                    universe_log[day] = list(universe)
+                last_uni_refresh = t
+
+            window = rets.iloc[t - LOOKBACK_DAYS:t][universe]
+            regime = detect_regime(window)
+            if regime != prev_regime:
+                prev_regime = regime
+            freq = get_rebalance_freq(regime)
+            if (t - last_rebalance) >= freq:
+                lambdas = get_lambdas(regime)
+
+            try:
+                w_new = solve_enhanced_cvar_portfolio(
+                    window, w_prev=w[universe].values, regime=regime, **lambdas,
+                )
+                alpha = 0.2 if regime == "risk_off" else 0.9
+                w_blend = alpha * w_new + (1 - alpha) * w[universe]
+
+                # Rewrite full-pool weights: only current-universe names hold weight
+                # (anything that left the universe is liquidated to 0).
+                w = pd.Series(0.0, index=pool_px.columns)
+                w[universe] = w_blend.values
+                last_rebalance = t
+
+                if w.sum() > MAX_INVEST:
+                    w *= MAX_INVEST / w.sum()
+                weights_record[day] = w.copy()
+            except Exception as e:
+                print(f"Optimization failed at {day}: {e}")
+
+        if t > 0 and w.sum() > 0:
+            equity *= 1.0 + float(rets.iloc[t] @ w)
+
+        if equity < 0.92 * max([e for _, e in curve], default=equity):
+            w *= 0.5
+
+        curve.append((day, equity))
+
+    curve = pd.Series(dict(curve))
+    weights = pd.DataFrame(weights_record).T.reindex(curve.index).ffill().fillna(0.0)
+    return curve, weights, universe_log
+
 # =====================
 # Performance metrics
 # =====================
@@ -412,14 +532,34 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--backtest", action="store_true")
     parser.add_argument("--paper", action="store_true")
+    parser.add_argument("--universe-size", type=int, default=8, help="Number of assets to select (default: 8)")
+    parser.add_argument(
+        "--universe-criterion", default="sharpe", choices=["sharpe", "calmar", "centroid"],
+        help="Selection criterion within each cluster (default: sharpe)"
+    )
+    parser.add_argument("--fast", action="store_true", help="Use CVXPYgen-compiled solver (~6x faster)")
     args = parser.parse_args()
 
-    px = fetch_alpaca_prices(UNIVERSE, START, END)
+    global USE_FAST_SOLVER
+    USE_FAST_SOLVER = args.fast
+
+    # For backtests, pass end_date=START to prevent lookahead bias in universe selection.
+    universe_end = START if args.backtest else None
+    print(f"Selecting universe (size={args.universe_size}, criterion={args.universe_criterion})...")
+    universe = build_universe(
+        target_size=args.universe_size,
+        criterion=args.universe_criterion,
+        end_date=universe_end,
+        verbose=True,
+    )
+    print()
+
+    px = fetch_alpaca_prices(universe, START, END)
 
     if args.backtest:
         print("Running backtest with enhanced CVaR + Drawdown control...")
         curve, weights = walk_forward_backtest(px)
-        
+
         metrics = calculate_metrics(curve)
         print(f"\n=== Backtest Results ===")
         print(f"Return:     {metrics['ann_return']:>7.2%}")
@@ -427,19 +567,21 @@ def main():
         print(f"Sharpe:     {metrics['sharpe']:>7.2f}")
         print(f"Max DD:     {metrics['max_dd']:>7.2%}")
         print(f"Calmar:     {metrics['calmar']:>7.2f}")
-        
+
         print(f"\nFinal weights:\n{weights.iloc[-1].round(4)}")
-        
+
         # Temporary plotting logic
-        """
+        # Start plot from the first day of actual trading (after lookback period)
+        start_date = curve[curve > 1.0].index[0] if len(curve[curve > 1.0]) > 0 else curve.index[0]
+        trading_curve = curve.loc[start_date:]
+
         plt.figure(figsize=(10, 6))
-        plt.plot(curve.index, curve.values)
-        plt.title('Portfolio Equity Over Backtest Period')
+        plt.plot(trading_curve.index, trading_curve.values)
+        plt.title('Portfolio Equity Over Trading Period')
         plt.xlabel('Date')
         plt.ylabel('Equity')
         plt.grid(True)
         plt.show()
-        """
 
     if args.paper:
         key = os.environ["APCA_API_KEY_ID"]
@@ -450,11 +592,11 @@ def main():
         current_positions = {
             p.symbol: float(p.market_value)
             for p in trading_client.get_all_positions()
-            if p.symbol in UNIVERSE
+            if p.symbol in universe
         }
 
         current_w = pd.Series(
-            {s: current_positions.get(s, 0.0) / equity for s in UNIVERSE}
+            {s: current_positions.get(s, 0.0) / equity for s in universe}
         )
 
         rets = px.pct_change().dropna()
@@ -476,7 +618,7 @@ def main():
         print(current_w.round(4))
         
         print("\nExecuting trades...")
-        # rebalance_alpaca_to_weights(target_w, current_w, equity)
+        rebalance_alpaca_to_weights(target_w, current_w, equity)
         print("Done!")
 
 if __name__ == "__main__":

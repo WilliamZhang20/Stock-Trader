@@ -1,1 +1,9 @@
 __pycache__
+
+# CVXPYgen-generated, compiled solvers (regenerable build artifacts)
+enhanced_cvar_code_*/
+
+# Experiment run logs
+trials/_run.log
+
+memory/
