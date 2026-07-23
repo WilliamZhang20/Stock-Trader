@@ -1,18 +1,19 @@
 # E1 — CVaR Trader vs S&P 500 vs Dow Jones
 
-**Window:** 2025-06-10 → 2026-06-10 (252 trading days)  
-**Universe selected as of:** 2023-12-24 (no lookahead)
+**Window:** 2025-07-22 → 2026-07-22 (252 trading days)  
+**Universe selected as of:** 2022-06-14 (no lookahead)
 
 Baseline CVaR trader on an 8-asset universe selected by PCA + k-means (one asset per cluster, Sharpe-ranked).
 
-**Universe:** `['GLD', 'AVGO', 'UNH', 'HYG', 'JPM', 'XOM', 'MCD', 'GOOGL']`
+**Universe:** `['KO', 'TSLA', 'CAT', 'EEM', 'LQD', 'SLV', 'PDBC', 'UNH']`
 
 ## Results
 
-| Strategy | Ann. Return | Ann. Vol | Sharpe | Max Drawdown |
+| Strategy | Ann. Return | Ann. Vol | Sharpe (excess) | Max Drawdown |
 |---|---|---|---|---|
-| CVaR (uniform/sharpe, 8) | 22.68% | 9.62% | 2.36 | -5.38% |
-| S&P 500 (SPY) | 20.29% | 12.23% | 1.66 | -9.13% |
-| Dow Jones (DIA) | 16.44% | 12.40% | 1.33 | -10.06% |
+| CVaR (uniform/sharpe, 8) | 38.90% | 10.81% | 3.23 | -5.06% |
+| S&P 500 (SPY) | 20.17% | 12.66% | 1.28 | -8.88% |
+| Dow Jones (DIA) | 18.96% | 12.28% | 1.22 | -9.76% |
+| 60/40 (SPY/IEF) | 12.68% | 8.20% | 1.06 | -6.00% |
 
 ![results](e1_cvar_baseline.png)

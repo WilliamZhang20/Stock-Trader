@@ -29,9 +29,9 @@ The **mean-variance** optimizer solves for $w$ in the problem below:
 \end{aligned}
 ```
 
-using a quadratic program in the `OSQP` solver from CVXPY. $\Sigma$ is the covariance matrix of the universe, and $\mu$ is average of portfolio return.
+using a quadratic program in the `OSQP` solver from CVXPY. $\Sigma$ is the Ledoit-Wolf shrinkage covariance matrix of the universe, and $\mu$ is the expected-return estimate.
 
-It also applies the Viterbi Algorithm for a Hidden Markov Model of the market regime for better risk management. Still tuning, but the last backtest resulted in a 48% annualized return with a sharpe ratio of 2.16.
+Rather than a raw sample mean (a notoriously noisy input that makes textbook Markowitz overfit), $\mu$ is a **Black-Litterman posterior**: momentum/EWMA "views" are shrunk toward a market-equilibrium prior obtained by reverse optimization. Portfolio risk is then stabilized by an explicit **volatility target** that scales gross exposure toward a fixed annualized vol. This "practical Markowitz" design replaces an earlier, fragile HMM regime-switching risk model that has since been removed. See [trials/e8_robustness.md](trials/e8_robustness.md) for net-of-cost, out-of-sample, benchmarked results.
 
 The **CVaR** optimizer solves:
 
@@ -68,9 +68,16 @@ $\mathbf{R}_t$ = vector of asset returns at time $t$.
 
 $N$ = number of assets in the universe.
 
-The CVaR strategy had much more robust performance, with a maximum drawdown of 13% from 2023 to 2026, a Sharpe Ratio of 1.95, and a Calmar Ratio of 1.72.
+The CVaR strategy has historically shown more robust, lower-drawdown performance than mean-variance. For current, apples-to-apples numbers (net of costs, benchmarked, and checked out-of-sample) see the [trials](trials/README.md) folder rather than any single headline figure quoted here.
 
-In comparison, the mean-variance strategy had a maximum drawdown of nearly 30%, which is quite a lot of risk.
+## Robustness & Caveats
+
+A high backtested annualized return (e.g. the ~43% seen on some mean-variance runs) should invite skepticism. Here is how each of the four usual objections is handled in this repo; the [E8 robustness report](trials/e8_robustness.md) quantifies all of them.
+
+- **Transaction costs.** Backtests charge `COST_BPS` (default 10 bps) on L1 turnover at every rebalance, deducted directly from the equity curve in both `cvar_trader.py` and `mean_variance_trader.py`. E8 reports gross vs net side by side so the cost drag is explicit. (Previously, costs were ignored and turnover was only a soft penalty in the objective.)
+- **Overfitting.** The strategies carry many hand-tuned constants, and several configurations were tried on the same data. E8 (a) scores each strategy on consecutive, non-overlapping out-of-sample sub-windows (consistency, not one lucky year) and (b) reports a **Deflated Sharpe Ratio** that discounts for having tried ~N configurations. The Markowitz overhaul also *reduces* the number of free knobs: volatility targeting and Black-Litterman replace the HMM's opaque state-to-multiplier machinery with interpretable parameters.
+- **Data leakage.** Universe selection is point-in-time (`build_universe(end_date=...)`), and every trade uses only returns strictly *before* the trade day (now enforced with `assert`s in both backtests; a look-ahead bug in the mean-variance window was fixed). Prices are split/dividend adjusted. The remaining, honestly-disclosed bias is **survivorship**: `CANDIDATE_POOL` lists tickers still trading today, so absolute returns are optimistic (documented in `market_analyzer.py`).
+- **Benchmark selection.** Benchmarks now use dividend-adjusted **total-return** prices, Sharpe ratios are computed **excess** of a ~4% risk-free rate (not the old `rf=0`), and a **60/40 (SPY/IEF)** comparator is included alongside SPY/DIA because these strategies often hold cash and run below-market volatility.
 
 ## Getting Started
 

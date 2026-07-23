@@ -33,8 +33,14 @@ from market_analyzer import build_universe, CANDIDATE_POOL
 WINDOW = 252                       # trading days in the evaluation window (~1yr)
 BENCHMARKS = {"SPY": "S&P 500 (SPY)", "DIA": "Dow Jones (DIA)"}
 TODAY = dt.date.today()
-DATA_START = (TODAY - dt.timedelta(days=900)).isoformat()  # ~2.4yr of data
+DATA_START = (TODAY - dt.timedelta(days=1500)).isoformat()  # ~4yr of data (room for several OOS sub-windows)
 SELECT_END = DATA_START            # pick universes using only pre-window data
+
+# Fair-benchmark accounting knobs.
+RISK_FREE = 0.04                   # annual risk-free rate for EXCESS-return Sharpe
+# Rough count of strategy configurations tried on this data (E1-E7 variants),
+# used to deflate the Sharpe ratio for multiple-testing (see deflated_sharpe).
+N_TRIALS = 8
 
 _MASTER_PX = None
 
@@ -73,15 +79,66 @@ def benchmark_series(index, sym):
     return bench / bench.iloc[0]
 
 
-def metrics(curve):
-    """Annualized return, vol, Sharpe, and max drawdown for a normalized curve."""
+def benchmark_6040(index, equity="SPY", bond="IEF"):
+    """
+    Daily-rebalanced 60/40 stock/bond benchmark, normalized to 1.0.
+
+    A fairer comparator than 100% equities because the strategies frequently hold
+    cash / bonds and run below-market volatility; comparing them to a pure-equity
+    index flatters their risk-adjusted numbers.
+    """
+    px = master_px()
+    e = px[equity].reindex(index).ffill().bfill().pct_change().fillna(0.0)
+    b = px[bond].reindex(index).ffill().bfill().pct_change().fillna(0.0)
+    blend = 0.6 * e + 0.4 * b
+    curve = (1.0 + blend).cumprod()
+    return curve / curve.iloc[0]
+
+
+def metrics(curve, rf=RISK_FREE):
+    """
+    Annualized return, vol, EXCESS-return Sharpe, and max drawdown for a curve
+    normalized to 1.0 at the start.
+
+    Sharpe uses `(ann_ret - rf) / ann_vol` so it is not inflated by simply
+    earning the ~4-5% cash rate (the old harness assumed rf=0).
+    """
     daily = curve.pct_change().dropna()
     n = len(curve)
     ann_ret = curve.iloc[-1] ** (252 / n) - 1
     ann_vol = daily.std() * np.sqrt(252)
-    sharpe = ann_ret / ann_vol if ann_vol > 0 else float("nan")
+    sharpe = (ann_ret - rf) / ann_vol if ann_vol > 0 else float("nan")
     dd = (curve - curve.cummax()) / curve.cummax()
     return dict(ann_ret=ann_ret, ann_vol=ann_vol, sharpe=sharpe, max_dd=dd.min())
+
+
+def deflated_sharpe(curve, n_trials=N_TRIALS, rf=RISK_FREE):
+    """
+    Probability that the observed (excess) Sharpe is genuinely > 0 after
+    accounting for having tried `n_trials` configurations on the same data
+    (Bailey & Lopez de Prado's Deflated Sharpe Ratio, non-annualized inputs).
+
+    A value near 1.0 means the result survives multiple-testing skepticism; near
+    0.5 or below means it is plausibly a fluke from selecting the best of many.
+    """
+    from scipy.stats import norm
+
+    daily = curve.pct_change().dropna()
+    T = len(daily)
+    if T < 20 or daily.std() == 0:
+        return float("nan")
+    sr = (daily.mean() - rf / 252) / daily.std()  # per-observation Sharpe
+    skew = float(daily.skew())
+    kurt = float(daily.kurtosis()) + 3.0          # pandas gives excess kurtosis
+    # Expected max Sharpe under the null of `n_trials` independent zero-skill trials.
+    sr_std = 1.0 / np.sqrt(T - 1)
+    gamma = 0.5772156649
+    e = np.e
+    z1 = norm.ppf(1 - 1.0 / n_trials)
+    z2 = norm.ppf(1 - 1.0 / (n_trials * e))
+    sr0 = sr_std * ((1 - gamma) * z1 + gamma * z2)
+    denom = np.sqrt(max(1 - skew * sr + (kurt - 1) / 4.0 * sr ** 2, 1e-9))
+    return float(norm.cdf(((sr - sr0) * np.sqrt(T - 1)) / denom))
 
 
 def run_cvar(universe, fast=False):
@@ -100,6 +157,49 @@ def run_mv(universe):
     t0 = time.time()
     curve, _ = mv.walk_forward_backtest(universe_px(universe))
     return windowed(curve), time.time() - t0
+
+
+def run_cvar_full(universe, cost_bps=None):
+    """Full (un-windowed) CVaR equity curve, optionally overriding COST_BPS."""
+    saved = ct.COST_BPS
+    if cost_bps is not None:
+        ct.COST_BPS = cost_bps
+    try:
+        curve, _ = ct.walk_forward_backtest(universe_px(universe))
+    finally:
+        ct.COST_BPS = saved
+    return curve.dropna()
+
+
+def run_mv_full(universe, cost_bps=None):
+    """Full (un-windowed) mean-variance equity curve, optionally overriding COST_BPS."""
+    saved = mv.COST_BPS
+    if cost_bps is not None:
+        mv.COST_BPS = cost_bps
+    try:
+        curve, _ = mv.walk_forward_backtest(universe_px(universe))
+    finally:
+        mv.COST_BPS = saved
+    return curve.dropna()
+
+
+def oos_windows(curve, size=WINDOW):
+    """
+    Split a full equity curve into consecutive non-overlapping sub-windows, each
+    renormalized to 1.0. Leading warm-up region (equity flat at 1.0) is trimmed.
+    Used to check that returns are consistent across periods, not one lucky year.
+    """
+    c = curve.dropna()
+    active = c[c != 1.0]
+    if len(active) > 0:
+        c = c.loc[active.index[0]:]
+    wins = []
+    for i in range(0, len(c) - size + 1, size):
+        seg = c.iloc[i:i + size]
+        wins.append(seg / seg.iloc[0])
+    if not wins:
+        wins = [c / c.iloc[0]]
+    return wins
 
 
 def run_cvar_rolling(allocation, refresh=63):
@@ -152,7 +252,7 @@ def make_report(slug, title, series: dict, body_md: str, metrics_rows: list):
     plt.close()
 
     # Metrics table
-    header = "| Strategy | Ann. Return | Ann. Vol | Sharpe | Max Drawdown |\n"
+    header = "| Strategy | Ann. Return | Ann. Vol | Sharpe (excess) | Max Drawdown |\n"
     header += "|---|---|---|---|---|\n"
     rows = ""
     for name, m in metrics_rows:
@@ -184,6 +284,9 @@ def add_benchmarks(series: dict):
         b = benchmark_series(idx, sym)
         out[label] = b
         bench_metrics.append((label, metrics(b)))
+    b6040 = benchmark_6040(idx)
+    out["60/40 (SPY/IEF)"] = b6040
+    bench_metrics.append(("60/40 (SPY/IEF)", metrics(b6040)))
     return out, bench_metrics
 
 
@@ -208,8 +311,9 @@ def exp_mv_baseline():
     curve, _ = run_mv(uni)
     series = {"Mean-Variance (uniform/sharpe, 9)": curve}
     series, bm = add_benchmarks(series)
-    body = ("Baseline mean-variance trader (HMM-regime risk aversion) on a 9-asset "
-            f"PCA/k-means universe.\n\n**Universe:** `{uni}`")
+    body = ("Baseline mean-variance trader (Black-Litterman posterior returns + volatility "
+            "targeting; the old HMM regime model has been removed) on a 9-asset PCA/k-means "
+            f"universe.\n\n**Universe:** `{uni}`")
     return make_report("e2_mv_baseline", "E2 — Mean-Variance Trader vs S&P 500 vs Dow Jones",
                        series, body, [("Mean-Variance (uniform/sharpe, 9)", metrics(curve))] + bm)
 
@@ -370,20 +474,111 @@ def exp_mv_rolling():
                        series, body, rows + bm)
 
 
+def exp_robustness():
+    print("\n[E8] Robustness: transaction costs, out-of-sample, deflated Sharpe")
+    uni_c = build_universe(target_size=8, end_date=SELECT_END)
+    uni_m = build_universe(target_size=9, end_date=SELECT_END)
+
+    cvar_gross = run_cvar_full(uni_c, cost_bps=0.0)
+    cvar_net = run_cvar_full(uni_c)
+    mv_gross = run_mv_full(uni_m, cost_bps=0.0)
+    mv_net = run_mv_full(uni_m)
+
+    gross_net_rows = [
+        ("CVaR gross (0 bps)", metrics(windowed(cvar_gross))),
+        ("CVaR net (10 bps)", metrics(windowed(cvar_net))),
+        ("Mean-Variance gross (0 bps)", metrics(windowed(mv_gross))),
+        ("Mean-Variance net (10 bps)", metrics(windowed(mv_net))),
+    ]
+    gn_header = ("| Strategy | Ann. Return | Ann. Vol | Sharpe (excess) | Max Drawdown |\n"
+                 "|---|---|---|---|---|\n")
+    gn_body = "".join(
+        f"| {n} | {m['ann_ret']:.2%} | {m['ann_vol']:.2%} | {m['sharpe']:.2f} | {m['max_dd']:.2%} |\n"
+        for n, m in gross_net_rows
+    )
+
+    def oos_rows(name, curve):
+        wins = oos_windows(curve)
+        ms = [metrics(seg) for seg in wins]
+        lines = []
+        for i, (seg, m) in enumerate(zip(wins, ms), 1):
+            lines.append(f"| {name} W{i} ({seg.index[0].date()}->{seg.index[-1].date()}) | "
+                         f"{m['ann_ret']:.2%} | {m['sharpe']:.2f} | {m['max_dd']:.2%} |")
+        rets = [m['ann_ret'] for m in ms]
+        shs = [m['sharpe'] for m in ms]
+        lines.append(f"| **{name} mean** | **{np.mean(rets):.2%}** | **{np.mean(shs):.2f}** | - |")
+        lines.append(f"| **{name} worst** | **{np.min(rets):.2%}** | **{np.min(shs):.2f}** | - |")
+        return lines
+
+    oos_header = "| Window | Ann. Return | Sharpe (excess) | Max Drawdown |\n|---|---|---|---|\n"
+    oos_body = "\n".join(oos_rows("CVaR", cvar_net) + oos_rows("Mean-Variance", mv_net))
+
+    dsr_c = deflated_sharpe(windowed(cvar_net))
+    dsr_m = deflated_sharpe(windowed(mv_net))
+
+    body = (
+        "Directly addresses the four reasons a high backtested return draws skepticism: "
+        "overfitting, transaction costs, data leakage, and benchmark selection.\n\n"
+        f"### 1. Transaction costs (gross vs net, last {WINDOW}d)\n"
+        f"Net charges {mv.COST_BPS:.0f} bps per unit of L1 turnover on every rebalance; "
+        "gross charges nothing. The gap is the honest cost drag:\n\n"
+        f"{gn_header}{gn_body}\n"
+        "### 2. Overfitting - out-of-sample consistency\n"
+        "The same frozen strategy scored on consecutive, non-overlapping ~1y sub-windows "
+        "(net of costs). A single lucky year is easy; consistency across windows is not:\n\n"
+        f"{oos_header}{oos_body}\n\n"
+        "### 2b. Overfitting - deflated Sharpe (multiple testing)\n"
+        f"Probability the excess Sharpe is real after ~{N_TRIALS} configurations were tried on "
+        f"this data: **CVaR {dsr_c:.2f}**, **Mean-Variance {dsr_m:.2f}** "
+        "(near 1.0 survives skepticism; near 0.5 is plausibly a fluke of selection).\n\n"
+        "### 3. Data leakage\n"
+        "Universe selection is point-in-time (`end_date=SELECT_END`); each trade uses only "
+        "returns strictly before the trade day (now asserted in both backtests). Prices are "
+        "split+dividend adjusted. Remaining bias: `CANDIDATE_POOL` is a survivors list "
+        "(documented in `market_analyzer.py`), so absolute returns are optimistic.\n\n"
+        "### 4. Benchmark selection\n"
+        f"Benchmarks use dividend-adjusted total-return prices, a {RISK_FREE:.0%} risk-free rate "
+        "for excess Sharpe, and add a 60/40 (SPY/IEF) comparator since these strategies often "
+        "hold cash and run below-market volatility.\n\n"
+        f"**CVaR universe:** `{uni_c}`\n\n**Mean-Variance universe:** `{uni_m}`"
+    )
+
+    series = {"CVaR (net)": windowed(cvar_net), "Mean-Variance (net)": windowed(mv_net)}
+    series, bm = add_benchmarks(series)
+    rows = [
+        ("CVaR (net)", metrics(windowed(cvar_net))),
+        ("Mean-Variance (net)", metrics(windowed(mv_net))),
+    ]
+    return make_report("e8_robustness",
+                       "E8 - Robustness: Costs, Out-of-Sample, Deflated Sharpe",
+                       series, body, rows + bm)
+
+
 def write_index(all_metrics: dict):
     e1 = all_metrics["E1"]
     e3 = all_metrics["E3"]
     e4 = all_metrics["E4"]
     e6 = all_metrics["E6"]
+    e8 = all_metrics["E8"]
     spy = e1["S&P 500 (SPY)"]
     dia = e1["Dow Jones (DIA)"]
     lines = [
         "# Trials\n",
         "Backtests of the CVaR and mean-variance traders over the most recent ~1-year "
-        "window, benchmarked against the S&P 500 (SPY) and Dow Jones (DIA). Universes are "
-        "chosen by `market_analyzer.build_universe` using only data available before the "
-        "window (no lookahead).\n",
+        "window, benchmarked against the S&P 500 (SPY), Dow Jones (DIA), and a 60/40 "
+        "(SPY/IEF) blend. Universes are chosen by `market_analyzer.build_universe` using "
+        "only data available before the window (no lookahead). Prices are dividend/split "
+        "adjusted, Sharpe ratios are **excess** of a "
+        f"{RISK_FREE:.0%} risk-free rate, and equity curves are **net of "
+        f"{mv.COST_BPS:.0f} bps** per-turnover transaction costs.\n",
         "## Key findings\n",
+        "- **The Markowitz trader was overhauled:** the fragile HMM regime detector is gone, "
+        "replaced by Black-Litterman posterior returns (equilibrium prior + momentum views) "
+        "and explicit volatility targeting - a far more robust, interpretable design.",
+        "- **Robustness checks (E8):** after charging costs, scoring out-of-sample across "
+        f"sub-windows, and deflating for multiple testing, CVaR net {_fmt(e8['CVaR (net)'])} "
+        f"and Mean-Variance net {_fmt(e8['Mean-Variance (net)'])}. See E8 for gross-vs-net, "
+        "per-window consistency, and deflated-Sharpe detail.",
         f"- **Benchmarks (this window):** SPY {_fmt(spy)}; DIA {_fmt(dia)}.",
         f"- **CVaR beats both benchmarks risk-adjusted** ({_fmt(e1['CVaR (uniform/sharpe, 8)'])}) "
         "with roughly half the drawdown of SPY.",
@@ -413,6 +608,7 @@ def write_index(all_metrics: dict):
         "| E5 — CVXPYgen compiled solver | [e5_fast_solver.md](e5_fast_solver.md) |",
         "| E6 — CVaR fixed vs rolling universe | [e6_cvar_rolling.md](e6_cvar_rolling.md) |",
         "| E7 — Mean-Variance fixed vs rolling universe | [e7_mv_rolling.md](e7_mv_rolling.md) |",
+        "| E8 — Robustness: costs / out-of-sample / deflated Sharpe | [e8_robustness.md](e8_robustness.md) |",
         "",
         "Regenerate with: `python trials/run_trials.py` (from the project root).",
         "",
@@ -435,6 +631,7 @@ def main():
     results["E5"] = exp_fast_solver_benchmark()
     results["E6"] = exp_cvar_rolling()
     results["E7"] = exp_mv_rolling()
+    results["E8"] = exp_robustness()
     write_index(results)
     print("\nAll trials complete.")
 

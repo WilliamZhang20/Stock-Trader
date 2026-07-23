@@ -1,14 +1,16 @@
 # Trials
 
-Backtests of the CVaR and mean-variance traders over the most recent ~1-year window, benchmarked against the S&P 500 (SPY) and Dow Jones (DIA). Universes are chosen by `market_analyzer.build_universe` using only data available before the window (no lookahead).
+Backtests of the CVaR and mean-variance traders over the most recent ~1-year window, benchmarked against the S&P 500 (SPY), Dow Jones (DIA), and a 60/40 (SPY/IEF) blend. Universes are chosen by `market_analyzer.build_universe` using only data available before the window (no lookahead). Prices are dividend/split adjusted, Sharpe ratios are **excess** of a 4% risk-free rate, and equity curves are **net of 10 bps** per-turnover transaction costs.
 
 ## Key findings
 
-- **Benchmarks (this window):** SPY 20.3% ret / 1.66 Sharpe / -9.1% DD; DIA 16.4% ret / 1.33 Sharpe / -10.1% DD.
-- **CVaR beats both benchmarks risk-adjusted** (22.7% ret / 2.36 Sharpe / -5.4% DD) with roughly half the drawdown of SPY.
-- **Adaptive cluster allocation is the standout knob** (34.1% ret / 2.77 Sharpe / -4.6% DD vs uniform 22.7% ret / 2.36 Sharpe / -5.4% DD): tilting universe slots toward the strongest-performing clusters improved return, Sharpe, and drawdown together.
-- **Mean-variance is higher-octane but riskier**; the simple risk-tightening correction (tighter weight cap + higher risk aversion) cut volatility and drawdown while keeping strong returns (48.1% ret / 6.01 Sharpe / -2.8% DD vs baseline 60.6% ret / 4.60 Sharpe / -4.9% DD).
-- **A rolling, adaptively-weighted universe is implemented** — the pool is re-surveyed each quarter and the per-cluster weighting re-adapts to recent performance. In this window it **underperformed** the stable fixed universe (rolling-adaptive 8.8% ret / 0.69 Sharpe / -12.2% DD vs fixed 22.7% ret / 2.41 Sharpe / -5.8% DD): quarterly winner-chasing added turnover and timing risk. The mechanism works; the naive momentum edge didn't pay here.
+- **The Markowitz trader was overhauled:** the fragile HMM regime detector is gone, replaced by Black-Litterman posterior returns (equilibrium prior + momentum views) and explicit volatility targeting - a far more robust, interpretable design.
+- **Robustness checks (E8):** after charging costs, scoring out-of-sample across sub-windows, and deflating for multiple testing, CVaR net 38.9% ret / 3.23 Sharpe / -5.1% DD and Mean-Variance net 12.1% ret / 0.58 Sharpe / -10.2% DD. See E8 for gross-vs-net, per-window consistency, and deflated-Sharpe detail.
+- **Benchmarks (this window):** SPY 20.2% ret / 1.28 Sharpe / -8.9% DD; DIA 19.0% ret / 1.22 Sharpe / -9.8% DD.
+- **CVaR beats both benchmarks risk-adjusted** (38.9% ret / 3.23 Sharpe / -5.1% DD) with roughly half the drawdown of SPY.
+- **Adaptive cluster allocation is the standout knob** (45.9% ret / 3.22 Sharpe / -5.8% DD vs uniform 38.9% ret / 3.23 Sharpe / -5.1% DD): tilting universe slots toward the strongest-performing clusters improved return, Sharpe, and drawdown together.
+- **Mean-variance is higher-octane but riskier**; the simple risk-tightening correction (tighter weight cap + higher risk aversion) cut volatility and drawdown while keeping strong returns (18.4% ret / 1.16 Sharpe / -8.4% DD vs baseline 12.1% ret / 0.58 Sharpe / -10.2% DD).
+- **A rolling, adaptively-weighted universe is implemented** — the pool is re-surveyed each quarter and the per-cluster weighting re-adapts to recent performance. In this window it **underperformed** the stable fixed universe (rolling-adaptive 12.3% ret / 0.93 Sharpe / -7.0% DD vs fixed 38.9% ret / 3.23 Sharpe / -5.1% DD): quarterly winner-chasing added turnover and timing risk. The mechanism works; the naive momentum edge didn't pay here.
 - **The CVXPYgen-compiled solver** (`fast_cvar.py`) is ~2x faster end-to-end with bit-identical results — see E5.
 
 ## Experiments
@@ -22,7 +24,8 @@ Backtests of the CVaR and mean-variance traders over the most recent ~1-year win
 | E5 — CVXPYgen compiled solver | [e5_fast_solver.md](e5_fast_solver.md) |
 | E6 — CVaR fixed vs rolling universe | [e6_cvar_rolling.md](e6_cvar_rolling.md) |
 | E7 — Mean-Variance fixed vs rolling universe | [e7_mv_rolling.md](e7_mv_rolling.md) |
+| E8 — Robustness: costs / out-of-sample / deflated Sharpe | [e8_robustness.md](e8_robustness.md) |
 
 Regenerate with: `python trials/run_trials.py` (from the project root).
 
-_Generated 2026-06-11. Returns are for one specific recent window and are not predictive; the harness re-selects universes and re-runs on each invocation._
+_Generated 2026-07-23. Returns are for one specific recent window and are not predictive; the harness re-selects universes and re-runs on each invocation._

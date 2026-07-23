@@ -1,23 +1,24 @@
 # E3 — CVaR Trader: Universe-Selection Variations
 
-**Window:** 2025-06-10 → 2026-06-10 (252 trading days)  
-**Universe selected as of:** 2023-12-24 (no lookahead)
+**Window:** 2025-07-22 → 2026-07-22 (252 trading days)  
+**Universe selected as of:** 2022-06-14 (no lookahead)
 
 How the universe-selection knobs affect the CVaR trader:
 
-- **uniform / sharpe:** `['GLD', 'AVGO', 'UNH', 'HYG', 'JPM', 'XOM', 'MCD', 'GOOGL']`
-- **adaptive / sharpe:** `['AVGO', 'CAT', 'XOM', 'XLE', 'CVX', 'USO', 'JPM', 'MCD']`
-- **uniform / calmar:** `['GLD', 'AVGO', 'UNH', 'LQD', 'JPM', 'XOM', 'MCD', 'GOOGL']`
+- **uniform / sharpe:** `['TSLA', 'SLV', 'LQD', 'EEM', 'PDBC', 'KO', 'CAT', 'UNH']`
+- **adaptive / sharpe:** `['TSLA', 'UNH', 'CAT', 'EEM', 'PDBC', 'USO', 'XLE', 'XOM']`
+- **uniform / calmar:** `['UNH', 'PDBC', 'TSLA', 'KO', 'XLB', 'LQD', 'EEM', 'SLV']`
 
 
 ## Results
 
-| Strategy | Ann. Return | Ann. Vol | Sharpe | Max Drawdown |
+| Strategy | Ann. Return | Ann. Vol | Sharpe (excess) | Max Drawdown |
 |---|---|---|---|---|
-| CVaR (uniform / sharpe) | 22.68% | 9.62% | 2.36 | -5.38% |
-| CVaR (adaptive / sharpe) | 34.08% | 12.31% | 2.77 | -4.56% |
-| CVaR (uniform / calmar) | 22.73% | 9.43% | 2.41 | -5.76% |
-| S&P 500 (SPY) | 20.29% | 12.23% | 1.66 | -9.13% |
-| Dow Jones (DIA) | 16.44% | 12.40% | 1.33 | -10.06% |
+| CVaR (uniform / sharpe) | 38.90% | 10.81% | 3.23 | -5.06% |
+| CVaR (adaptive / sharpe) | 45.88% | 12.99% | 3.22 | -5.84% |
+| CVaR (uniform / calmar) | 20.43% | 8.20% | 2.01 | -3.91% |
+| S&P 500 (SPY) | 20.17% | 12.66% | 1.28 | -8.88% |
+| Dow Jones (DIA) | 18.96% | 12.28% | 1.22 | -9.76% |
+| 60/40 (SPY/IEF) | 12.68% | 8.20% | 1.06 | -6.00% |
 
 ![results](e3_cvar_universe.png)

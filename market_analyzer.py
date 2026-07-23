@@ -10,8 +10,23 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
+# Total-return (splits + dividends) adjustment for fair, leak-free prices.
+try:
+    from alpaca.data.enums import Adjustment
+    _ADJ_ALL = Adjustment.ALL
+except Exception:
+    _ADJ_ALL = "all"
+
 # Broad candidate pool spanning all major asset classes and sectors.
 # The analyzer selects a diversified subset from these automatically.
+#
+# SURVIVORSHIP-BIAS CAVEAT: this is a hand-picked list of tickers that are still
+# liquid and listed *today*. It therefore excludes names that were delisted,
+# merged, or went to zero over the backtest window. Backtests on this pool will
+# be biased upward relative to a true point-in-time universe, because we only
+# ever trade companies that we already know survived. Universe *selection* is
+# still point-in-time (see `end_date`), but pool *membership* is not. Treat
+# absolute returns as optimistic; the risk-adjusted comparisons are more robust.
 CANDIDATE_POOL = [
     # Broad market
     "SPY", "QQQ", "IWM", "DIA", "VTI",
@@ -48,6 +63,7 @@ def _fetch_candidates(end_date, lookback_days):
         timeframe=TimeFrame.Day,
         start=start,
         end=end,
+        adjustment=_ADJ_ALL,
     )
     bars = client.get_stock_bars(request).df
     px = bars["close"].unstack(level=0).sort_index()

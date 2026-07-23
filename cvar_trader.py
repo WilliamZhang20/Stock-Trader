@@ -12,6 +12,13 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
+# Total-return (splits + dividends) adjustment for fair, leak-free prices.
+try:
+    from alpaca.data.enums import Adjustment
+    _ADJ_ALL = Adjustment.ALL
+except Exception:
+    _ADJ_ALL = "all"
+
 from market_analyzer import build_universe, select_universe
 import fast_cvar
 
@@ -40,6 +47,9 @@ MIN_WEIGHT_THRESHOLD = 0.01
 
 MIN_TRADE_PCT_NAV = 0.0025
 
+# Transaction costs charged in the backtest (round-trip, bps of traded notional).
+COST_BPS = 10.0
+
 # =====================
 # Alpaca helpers
 # =====================
@@ -56,6 +66,7 @@ def fetch_alpaca_prices(symbols, start, end):
         timeframe=TimeFrame.Day,
         start=pd.to_datetime(start),
         end=pd.to_datetime(end),
+        adjustment=_ADJ_ALL,
     )
     bars = client.get_stock_bars(request).df
     px = bars["close"].unstack(level=0)
@@ -345,8 +356,10 @@ def walk_forward_backtest(px):
     # Rebalance schedule
     last_rebalance = -1
     prev_regime = None
+    lambdas = get_lambdas("neutral")  # ensure defined before the first rebalance
     
     w = pd.Series(0.0, index=px.columns)
+    held_w = pd.Series(0.0, index=px.columns)  # weights held into each day (for cost accounting)
     equity = 1.0
     curve = []
     weights_record = {}
@@ -354,7 +367,9 @@ def walk_forward_backtest(px):
     for t, day in enumerate(dates):
         # Rebalance if it's a rebalance day
         if t >= LOOKBACK_DAYS:
+            # No lookahead: window ends strictly before the day we trade on.
             window = rets.iloc[t - LOOKBACK_DAYS:t]
+            assert window.index[-1] < day, "lookahead: window must end before the trade day"
             regime = detect_regime(window)
             if regime != prev_regime:
                 print(f"Regime change on {day.date()}: {prev_regime} -> {regime}")
@@ -385,13 +400,19 @@ def walk_forward_backtest(px):
             except Exception as e:
                 print(f"Optimization failed at {day}: {e}")
         
+        # Charge transaction costs on the change from yesterday's held weights.
+        turnover = float((w - held_w).abs().sum())
+        if turnover > 0:
+            equity *= (1.0 - COST_BPS / 1e4 * turnover)
+
         # Apply daily returns
         if t > 0 and w.sum() > 0:
             equity *= 1.0 + float(rets.iloc[t] @ w)
 
         if equity < 0.92 * max([e for _, e in curve], default=equity):
             w *= 0.5
-        
+
+        held_w = w.copy()  # end-of-day weights held into tomorrow (post de-risk)
         curve.append((day, equity))
     
     curve = pd.Series(dict(curve))
@@ -436,6 +457,7 @@ def walk_forward_backtest_dynamic(
     lambdas = get_lambdas("neutral")
 
     w = pd.Series(0.0, index=pool_px.columns)
+    held_w = pd.Series(0.0, index=pool_px.columns)  # weights held into each day (for cost accounting)
     universe = None
     last_uni_refresh = -10 ** 9
     equity = 1.0
@@ -458,7 +480,9 @@ def walk_forward_backtest_dynamic(
                     universe_log[day] = list(universe)
                 last_uni_refresh = t
 
+            # No lookahead: window ends strictly before the day we trade on.
             window = rets.iloc[t - LOOKBACK_DAYS:t][universe]
+            assert window.index[-1] < day, "lookahead: window must end before the trade day"
             regime = detect_regime(window)
             if regime != prev_regime:
                 prev_regime = regime
@@ -485,11 +509,18 @@ def walk_forward_backtest_dynamic(
             except Exception as e:
                 print(f"Optimization failed at {day}: {e}")
 
+        # Charge transaction costs on the change from yesterday's held weights.
+        turnover = float((w - held_w).abs().sum())
+        if turnover > 0:
+            equity *= (1.0 - COST_BPS / 1e4 * turnover)
+
         if t > 0 and w.sum() > 0:
             equity *= 1.0 + float(rets.iloc[t] @ w)
 
         if equity < 0.92 * max([e for _, e in curve], default=equity):
             w *= 0.5
+
+        held_w = w.copy()  # end-of-day weights held into tomorrow (post de-risk)
 
         curve.append((day, equity))
 
