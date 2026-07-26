@@ -568,6 +568,10 @@ def main():
         "--universe-criterion", default="sharpe", choices=["sharpe", "calmar", "centroid"],
         help="Selection criterion within each cluster (default: sharpe)"
     )
+    parser.add_argument(
+        "--universe-allocation", default="adaptive", choices=["uniform", "adaptive"],
+        help="Cluster slot allocation (default: adaptive — best risk-adjusted in trials)"
+    )
     parser.add_argument("--fast", action="store_true", help="Use CVXPYgen-compiled solver (~6x faster)")
     args = parser.parse_args()
 
@@ -576,10 +580,12 @@ def main():
 
     # For backtests, pass end_date=START to prevent lookahead bias in universe selection.
     universe_end = START if args.backtest else None
-    print(f"Selecting universe (size={args.universe_size}, criterion={args.universe_criterion})...")
+    print(f"Selecting universe (size={args.universe_size}, criterion={args.universe_criterion}, "
+          f"allocation={args.universe_allocation})...")
     universe = build_universe(
         target_size=args.universe_size,
         criterion=args.universe_criterion,
+        allocation=args.universe_allocation,
         end_date=universe_end,
         verbose=True,
     )

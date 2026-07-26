@@ -1,20 +1,20 @@
-# E4 — Mean-Variance Risk-Tightening Correction
+# E4 — Mean-Variance Practical Upgrade vs Legacy
 
-**Window:** 2025-07-22 → 2026-07-22 (252 trading days)  
-**Universe selected as of:** 2022-06-14 (no lookahead)
+**Window:** 2025-07-24 → 2026-07-24 (252 trading days)  
+**Universe selected as of:** 2022-06-17 (no lookahead)
 
-A simple, pragmatic correction to the mean-variance objective/constraints: halve the per-asset weight cap (0.40 → 0.20) and roughly double risk aversion (7 → 15). This trades some upside for materially smaller drawdowns.
+Ablation of the v6 practical-Markowitz upgrade against the previous defaults. Practical uses Iterated-EWMA covariance, weekly rebalancing, W_MAX=0.25, lambda_risk=12, TARGET_VOL=0.14. Legacy uses Ledoit-Wolf, daily rebalancing, W_MAX=0.40, lambda_risk=7, TARGET_VOL=0.12. Both still use Black-Litterman returns and charge 10 bps of turnover costs.
 
-**Universe:** `['CAT', 'HYG', 'UNH', 'SLV', 'AVGO', 'KO', 'PDBC', 'EEM', 'TSLA']`
+**Universe:** `['CAT', 'HYG', 'UNH', 'SLV', 'TSLA', 'KO', 'PDBC', 'EEM', 'XLI']`
 
 ## Results
 
 | Strategy | Ann. Return | Ann. Vol | Sharpe (excess) | Max Drawdown |
 |---|---|---|---|---|
-| MV baseline | 12.06% | 13.84% | 0.58 | -10.24% |
-| MV tightened | 18.38% | 12.38% | 1.16 | -8.45% |
-| S&P 500 (SPY) | 20.17% | 12.66% | 1.28 | -8.88% |
-| Dow Jones (DIA) | 18.96% | 12.28% | 1.22 | -9.76% |
-| 60/40 (SPY/IEF) | 12.68% | 8.20% | 1.06 | -6.00% |
+| MV practical | 40.33% | 14.08% | 2.58 | -7.39% |
+| MV legacy | 30.28% | 17.88% | 1.47 | -10.60% |
+| S&P 500 (SPY) | 17.77% | 12.71% | 1.08 | -8.88% |
+| Dow Jones (DIA) | 17.77% | 12.26% | 1.12 | -9.76% |
+| 60/40 (SPY/IEF) | 11.52% | 8.25% | 0.91 | -6.00% |
 
 ![results](e4_mv_risk_correction.png)

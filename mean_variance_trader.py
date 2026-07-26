@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """
-Version 5: rolling mean-variance (Markowitz) portfolio optimization.
+Version 6: practical mean-variance (Markowitz) portfolio optimization.
 
-Two upgrades over the textbook version, which is notoriously unstable because a
-raw sample mean is a very noisy return estimate:
+Textbook Markowitz is unstable because a raw sample mean is a noisy return
+estimate and a flat trailing covariance misses vol dynamics. This version
+follows the "practical Markowitz" line from Boyd et al. / ENGR108:
 
-1. Expected returns come from a **Black-Litterman posterior** (a market-equilibrium
-   prior shrinks the noisy EWMA/momentum "views"), not a raw sample mean. This is
-   the dominant lever for out-of-sample robustness.
-2. Portfolio risk is stabilized with an explicit **volatility target** rather than
-   a fragile regime-switching HMM. One interpretable knob (TARGET_VOL) scales gross
-   exposure so realized risk stays roughly constant across regimes.
+1. **Black-Litterman posterior returns** — EWMA views shrunk toward a
+   market-equilibrium prior (anti-overfitting on mu).
+2. **Iterated EWMA (IEWMA) covariance** — EWMA vols, then EWMA correlation of
+   vol-standardized returns (Engle / Barratt-Boyd). Much more responsive than
+   Ledoit-Wolf on a flat window.
+3. **Volatility targeting** — one knob (TARGET_VOL) scales gross exposure.
+4. **Weekly rebalancing + turnover penalty** — daily churn was eating
+   double-digit return under realistic cost assumptions.
 
-Together with the turnover penalty this is the "practical Markowitz" setup from
-https://stanford.edu/class/engr108/lectures/portfolio_slides.pdf
+Tuned via trials/improve_mv.py (IEWMA + weekly + tighter caps won on both
+last-year and out-of-sample excess Sharpe).
 """
 import os, argparse, math, datetime as dt
 import numpy as np
@@ -41,13 +44,13 @@ except Exception:
 
 START = "2023-01-01"
 END   = None
-REBAL_FREQ = "B" # Daily
-RETURN_LOOKBACK_DAYS = 100
+REBAL_EVERY_DAYS = 5       # weekly (trading days) — daily churn was the #1 cost drag
+RETURN_LOOKBACK_DAYS = 252
 EWMA_HALFLIFE_DAYS = 5
-LAMBDA_RISK = 7.0
-GAMMA_TC = 0.001
-TAU_TURNOVER = 0.40
-W_MAX = 0.40 # Slightly relaxed max weight
+LAMBDA_RISK = 12.0
+GAMMA_TC = 0.003
+TAU_TURNOVER = 0.30
+W_MAX = 0.25
 MAX_INVEST = 0.99
 
 # Black-Litterman parameters (return-estimate shrinkage).
@@ -55,8 +58,12 @@ BL_TAU = 0.05              # uncertainty of the equilibrium prior
 BL_DELTA = 2.5             # market risk-aversion for reverse optimization
 BL_VIEW_UNCERTAINTY = 1.0  # scales Omega; higher => trust the prior more (more shrinkage)
 
-# Volatility targeting (replaces the old HMM regime multipliers).
-TARGET_VOL = 0.12          # annualized portfolio volatility target
+# IEWMA covariance half-lives (vol then correlation), Barratt-Boyd defaults.
+IEWMA_VOL_HALFLIFE = 63
+IEWMA_COR_HALFLIFE = 125
+
+# Volatility targeting.
+TARGET_VOL = 0.14          # annualized portfolio volatility target
 
 # Transaction costs charged in the backtest (round-trip, bps of traded notional).
 COST_BPS = 10.0
@@ -122,8 +129,62 @@ def exp_weighted_mean_returns(returns, halflife_days):
     return pd.Series(mu, index=returns.columns)
 
 def shrinkage_cov(returns):
+    """Ledoit-Wolf shrinkage covariance (kept as a fallback / ablation)."""
     lw = LedoitWolf().fit(returns.values)
     return pd.DataFrame(lw.covariance_, index=returns.columns, columns=returns.columns)
+
+
+def iewma_cov(returns, vol_halflife=IEWMA_VOL_HALFLIFE, cor_halflife=IEWMA_COR_HALFLIFE):
+    """
+    Iterated EWMA covariance (Engle / Barratt-Boyd):
+
+      1. EWMA variance → per-asset volatility forecast
+      2. Standardize returns by those vols
+      3. EWMA correlation of the standardized series
+      4. Rebuild Sigma = D C D
+
+    Far more responsive to regime shifts than Ledoit-Wolf on a flat window —
+    this was the single largest performance lever in trials/improve_mv.py.
+    """
+    R = returns.values.astype(float)
+    T, N = R.shape
+    if T < 5:
+        return shrinkage_cov(returns)
+
+    a_vol = 1.0 - math.exp(-math.log(2) / vol_halflife)
+    a_cor = 1.0 - math.exp(-math.log(2) / cor_halflife)
+
+    var = np.maximum(R[0] ** 2, 1e-8)
+    vols = np.zeros((T, N))
+    vols[0] = np.sqrt(var)
+    for t in range(1, T):
+        var = (1 - a_vol) * var + a_vol * R[t] ** 2
+        vols[t] = np.sqrt(np.maximum(var, 1e-8))
+
+    Z = R / vols
+    C = np.outer(Z[0], Z[0])
+    for t in range(1, T):
+        C = (1 - a_cor) * C + a_cor * np.outer(Z[t], Z[t])
+
+    # Force a valid correlation matrix (unit diagonal + PSD).
+    d = np.sqrt(np.clip(np.diag(C), 1e-8, None))
+    C = C / np.outer(d, d)
+    np.fill_diagonal(C, 1.0)
+    eigvals, eigvecs = np.linalg.eigh(C)
+    eigvals = np.clip(eigvals, 1e-6, None)
+    C = eigvecs @ np.diag(eigvals) @ eigvecs.T
+    d = np.sqrt(np.clip(np.diag(C), 1e-8, None))
+    C = C / np.outer(d, d)
+    np.fill_diagonal(C, 1.0)
+
+    D = np.diag(vols[-1])
+    S = D @ C @ D + 1e-8 * np.eye(N)
+    return pd.DataFrame(S, index=returns.columns, columns=returns.columns)
+
+
+def estimate_cov(returns):
+    """Default covariance estimator used by the live / backtest paths."""
+    return iewma_cov(returns)
 
 def black_litterman_mu(
     returns,
@@ -243,8 +304,6 @@ def solve_portfolio(
 def walk_forward_backtest(px):
     rets = px.pct_change().dropna()
     dates = rets.index
-    rebal_dates = pd.date_range(dates[0], dates[-1], freq=REBAL_FREQ)
-    rebal_dates = [d for d in rebal_dates if d in dates and d >= dates[RETURN_LOOKBACK_DAYS]]
 
     w_prev = None
     current_w = pd.Series(0.0, index=px.columns)
@@ -252,17 +311,19 @@ def walk_forward_backtest(px):
     equity = 1.0
     equity_curve = []
     weights_record = {}
+    last_rebal = -10 ** 9
 
     for t_idx, today in enumerate(dates):
-        if today in rebal_dates:
+        if t_idx >= RETURN_LOOKBACK_DAYS and (t_idx - last_rebal) >= REBAL_EVERY_DAYS:
             # No lookahead: trade using only returns STRICTLY before `today`.
             window = rets.iloc[t_idx - RETURN_LOOKBACK_DAYS:t_idx]
             assert window.index[-1] < today, "lookahead: window must end before the trade day"
-            Sigma = shrinkage_cov(window)
+            Sigma = estimate_cov(window)
             mu = black_litterman_mu(window, Sigma)
             current_w = solve_portfolio(mu, Sigma, w_prev, lambda_risk=LAMBDA_RISK)
             weights_record[today] = current_w
             w_prev = current_w.values.copy()
+            last_rebal = t_idx
 
         # Charge transaction costs on the change from yesterday's held weights.
         turnover = float((current_w - held_w).abs().sum())
@@ -307,6 +368,7 @@ def walk_forward_backtest_dynamic(
     held_w = pd.Series(0.0, index=pool_px.columns)
     universe = None
     last_uni_refresh = -10 ** 9
+    last_rebal = -10 ** 9
     equity = 1.0
     equity_curve = []
     weights_record = {}
@@ -325,15 +387,18 @@ def walk_forward_backtest_dynamic(
                     universe = new_universe
                     universe_log[today] = list(universe)
                 last_uni_refresh = t_idx
+                last_rebal = -10 ** 9  # force a rebalance into the new universe
 
-            window = rets.iloc[t_idx - RETURN_LOOKBACK_DAYS:t_idx][universe]
-            Sigma = shrinkage_cov(window)
-            mu = black_litterman_mu(window, Sigma)
-            cur = solve_portfolio(mu, Sigma, w_prev=w[universe].values, lambda_risk=lambda_risk)
+            if (t_idx - last_rebal) >= REBAL_EVERY_DAYS:
+                window = rets.iloc[t_idx - RETURN_LOOKBACK_DAYS:t_idx][universe]
+                Sigma = estimate_cov(window)
+                mu = black_litterman_mu(window, Sigma)
+                cur = solve_portfolio(mu, Sigma, w_prev=w[universe].values, lambda_risk=lambda_risk)
 
-            w = pd.Series(0.0, index=pool_px.columns)
-            w[universe] = cur.values
-            weights_record[today] = w.copy()
+                w = pd.Series(0.0, index=pool_px.columns)
+                w[universe] = cur.values
+                weights_record[today] = w.copy()
+                last_rebal = t_idx
 
         turnover = float((w - held_w).abs().sum())
         if turnover > 0:
@@ -400,7 +465,7 @@ def main():
         rets = px.pct_change().dropna()
         window = rets.tail(RETURN_LOOKBACK_DAYS)
 
-        Sigma = shrinkage_cov(window)
+        Sigma = estimate_cov(window)
         mu = black_litterman_mu(window, Sigma)
         w = solve_portfolio(mu, Sigma, w_prev=current_w.values, lambda_risk=LAMBDA_RISK)
         print("Target weights:\n", w.round(4))

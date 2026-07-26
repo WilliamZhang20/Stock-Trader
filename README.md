@@ -31,7 +31,7 @@ The **mean-variance** optimizer solves for $w$ in the problem below:
 
 using a quadratic program in the `OSQP` solver from CVXPY. $\Sigma$ is the Ledoit-Wolf shrinkage covariance matrix of the universe, and $\mu$ is the expected-return estimate.
 
-Rather than a raw sample mean (a notoriously noisy input that makes textbook Markowitz overfit), $\mu$ is a **Black-Litterman posterior**: momentum/EWMA "views" are shrunk toward a market-equilibrium prior obtained by reverse optimization. Portfolio risk is then stabilized by an explicit **volatility target** that scales gross exposure toward a fixed annualized vol. This "practical Markowitz" design replaces an earlier, fragile HMM regime-switching risk model that has since been removed. See [trials/e8_robustness.md](trials/e8_robustness.md) for net-of-cost, out-of-sample, benchmarked results.
+Rather than a raw sample mean (a notoriously noisy input that makes textbook Markowitz overfit), $\mu$ is a **Black-Litterman posterior**: EWMA "views" are shrunk toward a market-equilibrium prior obtained by reverse optimization. $\Sigma$ is an **Iterated EWMA (IEWMA)** forecast (EWMA vols, then EWMA correlation of vol-standardized returns — Engle / Barratt-Boyd), not a flat trailing Ledoit-Wolf window. Portfolio risk is stabilized by an explicit **volatility target**, and the book rebalances **weekly** (daily churn was the dominant cost drag under realistic 10 bps turnover costs). This "practical Markowitz" design replaces an earlier, fragile HMM regime-switching risk model. Ablations live in [trials/improve_mv.py](trials/improve_mv.py); net-of-cost / OOS numbers in [trials/e8_robustness.md](trials/e8_robustness.md).
 
 The **CVaR** optimizer solves:
 

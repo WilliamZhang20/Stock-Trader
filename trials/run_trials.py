@@ -311,8 +311,8 @@ def exp_mv_baseline():
     curve, _ = run_mv(uni)
     series = {"Mean-Variance (uniform/sharpe, 9)": curve}
     series, bm = add_benchmarks(series)
-    body = ("Baseline mean-variance trader (Black-Litterman posterior returns + volatility "
-            "targeting; the old HMM regime model has been removed) on a 9-asset PCA/k-means "
+    body = ("Practical mean-variance trader (Black-Litterman returns + IEWMA covariance + "
+            "weekly rebalancing + volatility targeting) on a 9-asset PCA/k-means "
             f"universe.\n\n**Universe:** `{uni}`")
     return make_report("e2_mv_baseline", "E2 — Mean-Variance Trader vs S&P 500 vs Dow Jones",
                        series, body, [("Mean-Variance (uniform/sharpe, 9)", metrics(curve))] + bm)
@@ -343,34 +343,48 @@ def exp_cvar_universe_variations():
 
 
 def exp_mv_risk_correction():
-    print("\n[E4] Mean-Variance risk-tightening correction")
+    print("\n[E4] Mean-Variance practical upgrade vs legacy")
     uni = build_universe(target_size=9, end_date=SELECT_END)
 
-    base_curve, _ = run_mv(uni)
+    # Current defaults: IEWMA cov + weekly rebal + tighter caps (v6).
+    practical_curve, _ = run_mv(uni)
 
-    # Pragmatic correction: tighter concentration cap + higher risk aversion to
-    # tame the strategy's large drawdowns (README notes ~30% max DD).
-    saved = (mv.W_MAX, mv.LAMBDA_RISK)
-    mv.W_MAX, mv.LAMBDA_RISK = 0.20, 15.0
+    # Legacy ablation: Ledoit-Wolf + daily rebalance + looser caps (pre-upgrade).
+    saved = (
+        mv.W_MAX, mv.LAMBDA_RISK, mv.GAMMA_TC, mv.TAU_TURNOVER, mv.TARGET_VOL,
+        mv.REBAL_EVERY_DAYS, mv.RETURN_LOOKBACK_DAYS,
+    )
+    mv.W_MAX, mv.LAMBDA_RISK = 0.40, 7.0
+    mv.GAMMA_TC, mv.TAU_TURNOVER, mv.TARGET_VOL = 0.001, 0.40, 0.12
+    mv.REBAL_EVERY_DAYS, mv.RETURN_LOOKBACK_DAYS = 1, 100
+    # Temporarily swap the default cov estimator to Ledoit-Wolf.
+    _est = mv.estimate_cov
+    mv.estimate_cov = mv.shrinkage_cov
     try:
-        tight_curve, _ = run_mv(uni)
+        legacy_curve, _ = run_mv(uni)
     finally:
-        mv.W_MAX, mv.LAMBDA_RISK = saved
+        (mv.W_MAX, mv.LAMBDA_RISK, mv.GAMMA_TC, mv.TAU_TURNOVER, mv.TARGET_VOL,
+         mv.REBAL_EVERY_DAYS, mv.RETURN_LOOKBACK_DAYS) = saved
+        mv.estimate_cov = _est
 
     series = {
-        "MV baseline (W_MAX=0.40, lambda=7)": base_curve,
-        "MV tightened (W_MAX=0.20, lambda=15)": tight_curve,
+        "MV practical (IEWMA + weekly)": practical_curve,
+        "MV legacy (LW + daily)": legacy_curve,
     }
     series, bm = add_benchmarks(series)
-    body = ("A simple, pragmatic correction to the mean-variance objective/constraints: "
-            "halve the per-asset weight cap (0.40 → 0.20) and roughly double risk "
-            "aversion (7 → 15). This trades some upside for materially smaller "
-            f"drawdowns.\n\n**Universe:** `{uni}`")
+    body = (
+        "Ablation of the v6 practical-Markowitz upgrade against the previous defaults. "
+        "Practical uses Iterated-EWMA covariance, weekly rebalancing, W_MAX=0.25, "
+        "lambda_risk=12, TARGET_VOL=0.14. Legacy uses Ledoit-Wolf, daily rebalancing, "
+        "W_MAX=0.40, lambda_risk=7, TARGET_VOL=0.12. Both still use Black-Litterman "
+        f"returns and charge {mv.COST_BPS:.0f} bps of turnover costs.\n\n"
+        f"**Universe:** `{uni}`"
+    )
     rows = [
-        ("MV baseline", metrics(base_curve)),
-        ("MV tightened", metrics(tight_curve)),
+        ("MV practical", metrics(practical_curve)),
+        ("MV legacy", metrics(legacy_curve)),
     ]
-    return make_report("e4_mv_risk_correction", "E4 — Mean-Variance Risk-Tightening Correction",
+    return make_report("e4_mv_risk_correction", "E4 — Mean-Variance Practical Upgrade vs Legacy",
                        series, body, rows + bm)
 
 
@@ -572,9 +586,9 @@ def write_index(all_metrics: dict):
         f"{RISK_FREE:.0%} risk-free rate, and equity curves are **net of "
         f"{mv.COST_BPS:.0f} bps** per-turnover transaction costs.\n",
         "## Key findings\n",
-        "- **The Markowitz trader was overhauled:** the fragile HMM regime detector is gone, "
-        "replaced by Black-Litterman posterior returns (equilibrium prior + momentum views) "
-        "and explicit volatility targeting - a far more robust, interpretable design.",
+        "- **The Markowitz trader was overhauled:** HMM gone; Black-Litterman returns + "
+        "Iterated-EWMA covariance + weekly rebalancing + volatility targeting "
+        "(practical Markowitz / Boyd). See E4 ablation and trials/improve_mv.py.",
         "- **Robustness checks (E8):** after charging costs, scoring out-of-sample across "
         f"sub-windows, and deflating for multiple testing, CVaR net {_fmt(e8['CVaR (net)'])} "
         f"and Mean-Variance net {_fmt(e8['Mean-Variance (net)'])}. See E8 for gross-vs-net, "
@@ -586,10 +600,10 @@ def write_index(all_metrics: dict):
         f"({_fmt(e3['CVaR (adaptive / sharpe)'])} vs uniform "
         f"{_fmt(e3['CVaR (uniform / sharpe)'])}): tilting universe slots toward the "
         "strongest-performing clusters improved return, Sharpe, and drawdown together.",
-        "- **Mean-variance is higher-octane but riskier**; the simple risk-tightening "
-        f"correction (tighter weight cap + higher risk aversion) cut volatility and "
-        f"drawdown while keeping strong returns ({_fmt(e4['MV tightened'])} vs baseline "
-        f"{_fmt(e4['MV baseline'])}).",
+        "- **Practical Markowitz (IEWMA + weekly) beats the legacy daily/LW stack** "
+        f"({_fmt(e4['MV practical'])} vs legacy {_fmt(e4['MV legacy'])}): "
+        "Iterated-EWMA covariance and weekly rebalancing were the largest levers "
+        "(see trials/improve_mv.py).",
         "- **A rolling, adaptively-weighted universe is implemented** — the pool is "
         "re-surveyed each quarter and the per-cluster weighting re-adapts to recent "
         f"performance. In this window it **{'underperformed' if e6['CVaR rolling (adaptive)']['sharpe'] < e6['CVaR fixed']['sharpe'] else 'outperformed'}** "
@@ -604,7 +618,7 @@ def write_index(all_metrics: dict):
         "| E1 — CVaR baseline vs S&P/Dow | [e1_cvar_baseline.md](e1_cvar_baseline.md) |",
         "| E2 — Mean-Variance baseline vs S&P/Dow | [e2_mv_baseline.md](e2_mv_baseline.md) |",
         "| E3 — CVaR universe-selection variations | [e3_cvar_universe.md](e3_cvar_universe.md) |",
-        "| E4 — Mean-Variance risk-tightening | [e4_mv_risk_correction.md](e4_mv_risk_correction.md) |",
+        "| E4 — Mean-Variance practical vs legacy | [e4_mv_risk_correction.md](e4_mv_risk_correction.md) |",
         "| E5 — CVXPYgen compiled solver | [e5_fast_solver.md](e5_fast_solver.md) |",
         "| E6 — CVaR fixed vs rolling universe | [e6_cvar_rolling.md](e6_cvar_rolling.md) |",
         "| E7 — Mean-Variance fixed vs rolling universe | [e7_mv_rolling.md](e7_mv_rolling.md) |",

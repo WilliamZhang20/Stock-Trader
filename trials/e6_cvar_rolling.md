@@ -1,7 +1,7 @@
 # E6 — CVaR Trader: Fixed vs Rolling Universe
 
-**Window:** 2025-07-22 → 2026-07-22 (252 trading days)  
-**Universe selected as of:** 2022-06-14 (no lookahead)
+**Window:** 2025-07-24 → 2026-07-24 (252 trading days)  
+**Universe selected as of:** 2022-06-17 (no lookahead)
 
 The universe is re-surveyed every ~quarter (63 trading days) using only past data, so the portfolio can rotate into newly-surging leaders. Three modes:
 
@@ -15,19 +15,19 @@ The universe is re-surveyed every ~quarter (63 trading days) using only past dat
 
 13 re-selections:
 
-- 2023-06-16: `['NVDA', 'AVGO', 'XLK', 'QQQ', 'GE', 'BA', 'MCD', 'LQD']`
-- 2023-09-18: `['MCD', 'GE', 'NVDA', 'META', 'QQQ', 'XLK', 'MSFT', 'XOM']`
-- 2023-12-15: `['XLK', 'QQQ', 'META', 'AAPL', 'GE', 'AVGO', 'NVDA', 'GLD']`
-- 2024-03-19: `['NVDA', 'AVGO', 'META', 'XLK', 'GE', 'XOM', 'ITA', 'BA']`
-- 2024-06-18: `['HYG', 'GE', 'NVDA', 'META', 'AVGO', 'QQQ', 'XLK', 'ITA']`
-- 2024-09-18: `['XLF', 'JPM', 'GS', 'BAC', 'NVDA', 'META', 'GE', 'HYG']`
-- 2024-12-17: `['NVDA', 'AVGO', 'QQQ', 'XLC', 'META', 'AMZN', 'GOOGL', 'XLF']`
-- 2025-03-21: `['NVDA', 'SPY', 'XLC', 'META', 'GLD', 'GE', 'HYG', 'BND']`
-- 2025-06-23: `['GE', 'XLU', 'GLD', 'XLC', 'META', 'SLV', 'MSFT', 'XOM']`
-- 2025-09-22: `['GS', 'GE', 'HYG', 'GLD', 'FXI', 'BND', 'LQD', 'CVX']`
-- 2025-12-19: `['XLU', 'GLD', 'SLV', 'GS', 'HYG', 'GE', 'XLC', 'BND']`
-- 2026-03-24: `['MU', 'GLD', 'CVX', 'PDBC', 'XOM', 'ITA', 'GE', 'BA']`
-- 2026-06-24: `['BND', 'MU', 'JNJ', 'GE', 'ITA', 'GLD', 'PDBC', 'XOM']`
+- 2023-06-22: `['NVDA', 'AVGO', 'XLK', 'AAPL', 'XOM', 'GE', 'BA', 'MCD']`
+- 2023-09-21: `['GE', 'NVDA', 'AVGO', 'META', 'CAT', 'GLD', 'XOM', 'XLE']`
+- 2023-12-20: `['MCD', 'GE', 'BA', 'AVGO', 'NVDA', 'XLK', 'QQQ', 'META']`
+- 2024-03-22: `['NVDA', 'AVGO', 'XLK', 'MU', 'TSM', 'GE', 'XOM', 'PG']`
+- 2024-06-24: `['JPM', 'XLF', 'NVDA', 'META', 'QQQ', 'XLK', 'XLC', 'GE']`
+- 2024-09-23: `['HYG', 'KO', 'XLP', 'GE', 'NVDA', 'SPY', 'META', 'VTI']`
+- 2024-12-20: `['NVDA', 'AVGO', 'QQQ', 'XLC', 'META', 'AMZN', 'GOOGL', 'XLF']`
+- 2025-03-26: `['NVDA', 'SPY', 'XLC', 'META', 'AMZN', 'GE', 'GLD', 'HYG']`
+- 2025-06-26: `['GE', 'NVDA', 'XLU', 'GLD', 'XLC', 'META', 'SLV', 'MSFT']`
+- 2025-09-25: `['GE', 'HYG', 'ITA', 'GLD', 'SLV', 'BND', 'LQD', 'CVX']`
+- 2025-12-24: `['HYG', 'GS', 'ITA', 'GLD', 'SLV', 'BND', 'LQD', 'XOM']`
+- 2026-03-27: `['XLU', 'MU', 'ITA', 'GE', 'PDBC', 'CVX', 'XOM', 'XLE']`
+- 2026-06-29: `['BND', 'MU', 'JNJ', 'GE', 'ITA', 'GLD', 'SLV', 'PDBC']`
 
 **Fixed universe:** `['UNH', 'PDBC', 'TSLA', 'KO', 'CAT', 'LQD', 'EEM', 'SLV']`
 
@@ -35,11 +35,11 @@ The universe is re-surveyed every ~quarter (63 trading days) using only past dat
 
 | Strategy | Ann. Return | Ann. Vol | Sharpe (excess) | Max Drawdown |
 |---|---|---|---|---|
-| CVaR fixed | 38.90% | 10.81% | 3.23 | -5.06% |
-| CVaR rolling (uniform) | 19.52% | 7.84% | 1.98 | -6.79% |
-| CVaR rolling (adaptive) | 12.26% | 8.93% | 0.93 | -7.03% |
-| S&P 500 (SPY) | 20.17% | 12.66% | 1.28 | -8.88% |
-| Dow Jones (DIA) | 18.96% | 12.28% | 1.22 | -9.76% |
-| 60/40 (SPY/IEF) | 12.68% | 8.20% | 1.06 | -6.00% |
+| CVaR fixed | 38.43% | 10.82% | 3.18 | -5.06% |
+| CVaR rolling (uniform) | 22.66% | 7.91% | 2.36 | -5.46% |
+| CVaR rolling (adaptive) | 18.50% | 9.11% | 1.59 | -7.74% |
+| S&P 500 (SPY) | 17.77% | 12.71% | 1.08 | -8.88% |
+| Dow Jones (DIA) | 17.77% | 12.26% | 1.12 | -9.76% |
+| 60/40 (SPY/IEF) | 11.52% | 8.25% | 0.91 | -6.00% |
 
 ![results](e6_cvar_rolling.png)
