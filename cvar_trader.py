@@ -73,6 +73,11 @@ def fetch_alpaca_prices(symbols, start, end):
     return px.sort_index()
 
 def rebalance_alpaca_to_weights(target_w, current_w, notional):
+    """
+    Submit market orders to reach `target_w`. Also liquidates any open position
+    whose symbol is absent from (or zero in) the target book — otherwise names
+    that leave the rolling universe would linger forever.
+    """
     key = os.environ["APCA_API_KEY_ID"]
     secret = os.environ["APCA_API_SECRET_KEY"]
     trading_client = TradingClient(key, secret, paper=True)
@@ -82,12 +87,17 @@ def rebalance_alpaca_to_weights(target_w, current_w, notional):
         for p in trading_client.get_all_positions()
     }
 
-    for sym, tgt_w in target_w.items():
+    # Full target book: every currently held name defaults to 0 unless retargeted.
+    full_target = {sym: 0.0 for sym in current_positions}
+    for sym, w in target_w.items():
+        full_target[sym] = float(w)
+
+    for sym, tgt_w in full_target.items():
         cur = current_positions.get(sym, 0.0)
         tgt = tgt_w * notional
         delta = tgt - cur
 
-        if abs(delta) / notional < MIN_TRADE_PCT_NAV:
+        if abs(delta) / max(notional, 1.0) < MIN_TRADE_PCT_NAV:
             continue
 
         side = OrderSide.BUY if delta > 0 else OrderSide.SELL
@@ -95,6 +105,8 @@ def rebalance_alpaca_to_weights(target_w, current_w, notional):
         if notional_trade < 1.0:
             continue
 
+        # Selling an entire leftover position: prefer qty close if notional rounding
+        # would leave a dust remnant, but notional orders are fine for Alpaca paper.
         trading_client.submit_order(
             MarketOrderRequest(
                 symbol=sym,
@@ -103,6 +115,7 @@ def rebalance_alpaca_to_weights(target_w, current_w, notional):
                 time_in_force=TimeInForce.DAY,
             )
         )
+        print(f"  {side.value:4} {sym:6} ${notional_trade:,.2f}")
 
 def detect_regime(rets, lookback=63, crash_thresh=-0.08, cvar_thresh=0.02):
     """
@@ -626,15 +639,19 @@ def main():
         trading_client = TradingClient(key, secret, paper=True)
         equity = float(trading_client.get_account().equity)
 
-        current_positions = {
+        # Include ALL open positions (not just current-universe names) so the
+        # rebalancer can liquidate leftovers when the universe rotates.
+        all_positions = {
             p.symbol: float(p.market_value)
             for p in trading_client.get_all_positions()
-            if p.symbol in universe
         }
-
         current_w = pd.Series(
-            {s: current_positions.get(s, 0.0) / equity for s in universe}
+            {s: all_positions.get(s, 0.0) / equity for s in universe}
         )
+        leftovers = {s: v / equity for s, v in all_positions.items() if s not in universe}
+        if leftovers:
+            print(f"Positions leaving universe (will liquidate): "
+                  f"{ {k: round(v, 4) for k, v in leftovers.items()} }")
 
         rets = px.pct_change().dropna()
         window = rets.tail(LOOKBACK_DAYS)
@@ -643,17 +660,19 @@ def main():
         regime = detect_regime(window)
         print(f"Paper trading regime on {window.index[-1].date()}: {regime}")
         lambdas = get_lambdas(regime)
-        target_w = solve_enhanced_cvar_portfolio(window, w_prev=current_w.values, regime=regime, **lambdas)
-        alpha = 0.2 if regime=="risk_off" else 0.9
-        target_w = alpha * target_w + (1-alpha) * current_w
+        # Blend only against in-universe holdings; leftovers are sold to 0.
+        w_prev = current_w.reindex(universe).fillna(0.0).values
+        target_w = solve_enhanced_cvar_portfolio(window, w_prev=w_prev, regime=regime, **lambdas)
+        alpha = 0.2 if regime == "risk_off" else 0.9
+        target_w = alpha * target_w + (1 - alpha) * current_w.reindex(universe).fillna(0.0)
         # No normalization to allow cash
 
         print("\n=== Target Weights ===")
         print(target_w.round(4))
-        
-        print("\n=== Current Weights ===")
+
+        print("\n=== Current (in-universe) Weights ===")
         print(current_w.round(4))
-        
+
         print("\nExecuting trades...")
         rebalance_alpaca_to_weights(target_w, current_w, equity)
         print("Done!")
