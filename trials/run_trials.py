@@ -25,7 +25,7 @@ if _ROOT not in sys.path:
 
 import cvar_trader as ct
 import mean_variance_trader as mv
-from market_analyzer import build_universe, CANDIDATE_POOL
+from market_analyzer import build_universe, CANDIDATE_POOL, select_universe
 
 # ---------------------------------------------------------------------------
 # Config
@@ -172,14 +172,21 @@ def run_cvar_full(universe, cost_bps=None):
 
 
 def run_mv_full(universe, cost_bps=None):
-    """Full (un-windowed) mean-variance equity curve, optionally overriding COST_BPS."""
-    saved = mv.COST_BPS
+    """
+    Full (un-windowed) mean-variance equity curve.
+
+    ``cost_bps`` scales the asset-specific cost floor: 0 → zero costs (gross);
+    None → current BASE_COST_BPS / VOL_COST_MULT defaults.
+    """
+    saved = (mv.BASE_COST_BPS, mv.VOL_COST_MULT, mv.COST_BPS)
     if cost_bps is not None:
-        mv.COST_BPS = cost_bps
+        mv.BASE_COST_BPS = float(cost_bps)
+        mv.VOL_COST_MULT = 0.0 if cost_bps == 0 else mv.VOL_COST_MULT
+        mv.COST_BPS = float(cost_bps)
     try:
         curve, _ = mv.walk_forward_backtest(universe_px(universe))
     finally:
-        mv.COST_BPS = saved
+        mv.BASE_COST_BPS, mv.VOL_COST_MULT, mv.COST_BPS = saved
     return curve.dropna()
 
 
@@ -343,48 +350,45 @@ def exp_cvar_universe_variations():
 
 
 def exp_mv_risk_correction():
-    print("\n[E4] Mean-Variance practical upgrade vs legacy")
+    print("\n[E4] Mean-Variance v7 (relative BL + asset costs) vs absolute-views ablation")
     uni = build_universe(target_size=9, end_date=SELECT_END)
 
-    # Current defaults: IEWMA cov + weekly rebal + tighter caps (v6).
+    # Current defaults: relative BL views + asset-specific costs + daily rebal.
     practical_curve, _ = run_mv(uni)
 
-    # Legacy ablation: Ledoit-Wolf + daily rebalance + looser caps (pre-upgrade).
-    saved = (
-        mv.W_MAX, mv.LAMBDA_RISK, mv.GAMMA_TC, mv.TAU_TURNOVER, mv.TARGET_VOL,
-        mv.REBAL_EVERY_DAYS, mv.RETURN_LOOKBACK_DAYS,
-    )
-    mv.W_MAX, mv.LAMBDA_RISK = 0.40, 7.0
-    mv.GAMMA_TC, mv.TAU_TURNOVER, mv.TARGET_VOL = 0.001, 0.40, 0.12
-    mv.REBAL_EVERY_DAYS, mv.RETURN_LOOKBACK_DAYS = 1, 100
-    # Temporarily swap the default cov estimator to Ledoit-Wolf.
-    _est = mv.estimate_cov
-    mv.estimate_cov = mv.shrinkage_cov
+    # Ablation: absolute-only BL views (P = I).
+    _bl = mv.black_litterman_mu
+
+    def _abs_only(returns, Sigma, **kwargs):
+        kwargs = dict(kwargs)
+        kwargs["use_relative_views"] = False
+        return _bl(returns, Sigma, **kwargs)
+
+    mv.black_litterman_mu = _abs_only
     try:
-        legacy_curve, _ = run_mv(uni)
+        abs_curve, _ = run_mv(uni)
     finally:
-        (mv.W_MAX, mv.LAMBDA_RISK, mv.GAMMA_TC, mv.TAU_TURNOVER, mv.TARGET_VOL,
-         mv.REBAL_EVERY_DAYS, mv.RETURN_LOOKBACK_DAYS) = saved
-        mv.estimate_cov = _est
+        mv.black_litterman_mu = _bl
 
     series = {
-        "MV practical (IEWMA + weekly)": practical_curve,
-        "MV legacy (LW + daily)": legacy_curve,
+        "MV v7 relative": practical_curve,
+        "MV absolute-only": abs_curve,
     }
     series, bm = add_benchmarks(series)
     body = (
-        "Ablation of the v6 practical-Markowitz upgrade against the previous defaults. "
-        "Practical uses Iterated-EWMA covariance, weekly rebalancing, W_MAX=0.25, "
-        "lambda_risk=12, TARGET_VOL=0.14. Legacy uses Ledoit-Wolf, daily rebalancing, "
-        "W_MAX=0.40, lambda_risk=7, TARGET_VOL=0.12. Both still use Black-Litterman "
-        f"returns and charge {mv.COST_BPS:.0f} bps of turnover costs.\n\n"
-        f"**Universe:** `{uni}`"
+        "Ablation of the v7 relative Black-Litterman views. Both arms use IEWMA "
+        "covariance, daily rebalancing, volatility targeting, and asset-specific "
+        f"L1 trading costs (base {mv.BASE_COST_BPS:.0f} bps + vol load). The "
+        "treatment adds residual mean-reversion relative views (P_k = e_i - β e_j) "
+        "between correlated peers; the ablation keeps only absolute EWMA views "
+        f"(P = I).\n\n**Universe:** `{uni}`"
     )
     rows = [
-        ("MV practical", metrics(practical_curve)),
-        ("MV legacy", metrics(legacy_curve)),
+        ("MV v7 relative", metrics(practical_curve)),
+        ("MV absolute-only", metrics(abs_curve)),
     ]
-    return make_report("e4_mv_risk_correction", "E4 — Mean-Variance Practical Upgrade vs Legacy",
+    return make_report("e4_mv_risk_correction",
+                       "E4 — Mean-Variance Relative BL Views vs Absolute-Only",
                        series, body, rows + bm)
 
 
@@ -502,7 +506,8 @@ def exp_robustness():
         ("CVaR gross (0 bps)", metrics(windowed(cvar_gross))),
         ("CVaR net (10 bps)", metrics(windowed(cvar_net))),
         ("Mean-Variance gross (0 bps)", metrics(windowed(mv_gross))),
-        ("Mean-Variance net (10 bps)", metrics(windowed(mv_net))),
+        (f"Mean-Variance net (asset c_i, base {mv.BASE_COST_BPS:.0f}bps)",
+         metrics(windowed(mv_net))),
     ]
     gn_header = ("| Strategy | Ann. Return | Ann. Vol | Sharpe (excess) | Max Drawdown |\n"
                  "|---|---|---|---|---|\n")
@@ -534,8 +539,10 @@ def exp_robustness():
         "Directly addresses the four reasons a high backtested return draws skepticism: "
         "overfitting, transaction costs, data leakage, and benchmark selection.\n\n"
         f"### 1. Transaction costs (gross vs net, last {WINDOW}d)\n"
-        f"Net charges {mv.COST_BPS:.0f} bps per unit of L1 turnover on every rebalance; "
-        "gross charges nothing. The gap is the honest cost drag:\n\n"
+        f"CVaR net charges {ct.COST_BPS:.0f} bps per unit of L1 turnover. "
+        f"Mean-Variance net uses asset-specific costs "
+        f"`sum_i c_i |dw_i|` (base {mv.BASE_COST_BPS:.0f} bps + vol load) in *both* "
+        "the QP and the equity curve — the no-trade region. Gross charges nothing:\n\n"
         f"{gn_header}{gn_body}\n"
         "### 2. Overfitting - out-of-sample consistency\n"
         "The same frozen strategy scored on consecutive, non-overlapping ~1y sub-windows "
@@ -568,14 +575,188 @@ def exp_robustness():
                        series, body, rows + bm)
 
 
+def _block_bootstrap_returns(rets, block=10, rng=None):
+    """
+    Stationary block bootstrap of a multivariate daily-return panel.
+    Preserves cross-sectional dependence within a day and local vol clustering
+    within blocks; destroys long-range spurious predictability.
+    """
+    rng = rng or np.random.default_rng()
+    T, N = rets.shape
+    if T < block * 2:
+        block = max(2, T // 5)
+    n_blocks = int(np.ceil(T / block))
+    starts = rng.integers(0, T - block + 1, size=n_blocks)
+    pieces = [rets.iloc[s:s + block].values for s in starts]
+    boot = np.vstack(pieces)[:T]
+    return pd.DataFrame(boot, index=rets.index, columns=rets.columns)
+
+
+def exp_bootstrap_selection(n_boot=40, block=10):
+    """
+    E9 — Randomized-data benchmarking of the *selection process*.
+
+    Unlike the analytic Deflated Sharpe (E8) which assumes a fixed N_TRIALS, this
+    re-runs the full config search on block-bootstrap return panels and asks:
+    how often does a no-alpha world produce a best Sharpe as large as the one we
+    saw on real data?
+    """
+    print(f"\n[E9] Bootstrap selection benchmark ({n_boot} resamples, block={block})")
+    rng = np.random.default_rng(42)
+
+    # Chronological split: everything before the last WINDOW is the *selection*
+    # period; the final WINDOW is held out untouched until the end.
+    px_all = pool_px()
+    rets_all = px_all.pct_change().dropna()
+    if len(rets_all) < WINDOW * 2 + 50:
+        print("  insufficient history for E9; skipping")
+        return {}
+
+    select_rets = rets_all.iloc[:-WINDOW]
+    # Prices reconstructed from returns for the MV/CVaR walk-forward APIs.
+    def rets_to_px(r):
+        return (1.0 + r).cumprod()
+
+    configs = {
+        "CVaR uniform": ("cvar", dict(allocation="uniform", criterion="sharpe")),
+        "CVaR adaptive": ("cvar", dict(allocation="adaptive", criterion="sharpe")),
+        "MV relative-BL": ("mv", dict(relative=True)),
+        "MV absolute-BL": ("mv", dict(relative=False)),
+    }
+
+    def _score_mv(px_panel, cols, relative):
+        saved = mv.black_litterman_mu
+        if not relative:
+            def _abs(returns, Sigma, **kw):
+                kw = dict(kw)
+                kw["use_relative_views"] = False
+                return saved(returns, Sigma, **kw)
+            mv.black_litterman_mu = _abs
+        try:
+            curve, _ = mv.walk_forward_backtest(px_panel[cols].dropna(how="any"))
+        finally:
+            mv.black_litterman_mu = saved
+        return curve
+
+    # Real-data selection: best Sharpe on the selection window.
+    real_scores = {}
+    for name, ck in configs.items():
+        if ck[0] == "cvar":
+            uni = build_universe(target_size=8, end_date=SELECT_END, **ck[1])
+            curve, _ = ct.walk_forward_backtest(universe_px(uni))
+        else:
+            uni = build_universe(target_size=9, end_date=SELECT_END, criterion="sharpe")
+            curve = _score_mv(universe_px(uni), list(uni), ck[1].get("relative", True))
+        # Selection-period score = metrics on the slice before holdout.
+        sel_curve = curve.loc[:select_rets.index[-1]].dropna()
+        if len(sel_curve) < 30:
+            real_scores[name] = float("nan")
+            continue
+        sel_curve = sel_curve / sel_curve.iloc[0]
+        # Use last WINDOW of selection period for comparable length.
+        real_scores[name] = metrics(windowed(sel_curve))["sharpe"]
+        print(f"  real selection Sharpe [{name}]: {real_scores[name]:.2f}")
+
+    best_name = max(real_scores, key=lambda k: (real_scores[k] if real_scores[k] == real_scores[k] else -1e9))
+    best_real = real_scores[best_name]
+    print(f"  best real config: {best_name} ({best_real:.2f})")
+
+    # Bootstrap null: reshuffle selection-period returns, re-search configs.
+    boot_best = []
+    for b in range(n_boot):
+        boot_rets = _block_bootstrap_returns(select_rets, block=block, rng=rng)
+        boot_px = rets_to_px(boot_rets)
+        scores = []
+        for name, ck in configs.items():
+            try:
+                if ck[0] == "cvar":
+                    uni = select_universe(
+                        boot_rets.tail(min(378, len(boot_rets))),
+                        target_size=8, **ck[1],
+                    )
+                    cols = [c for c in uni if c in boot_px.columns]
+                    curve, _ = ct.walk_forward_backtest(boot_px[cols].dropna(how="any"))
+                else:
+                    uni = select_universe(
+                        boot_rets.tail(min(378, len(boot_rets))),
+                        target_size=9, criterion="sharpe",
+                    )
+                    cols = [c for c in uni if c in boot_px.columns]
+                    curve = _score_mv(boot_px, cols, ck[1].get("relative", True))
+                sc = metrics(windowed(curve))["sharpe"]
+                if sc == sc:
+                    scores.append(sc)
+            except Exception:
+                continue
+        boot_best.append(max(scores) if scores else float("nan"))
+        if (b + 1) % 10 == 0:
+            print(f"  bootstrap {b+1}/{n_boot}...")
+
+    boot_best = np.asarray(boot_best, dtype=float)
+    boot_best = boot_best[np.isfinite(boot_best)]
+    p_value = float(np.mean(boot_best >= best_real)) if len(boot_best) else float("nan")
+    p95 = float(np.quantile(boot_best, 0.95)) if len(boot_best) else float("nan")
+
+    # Holdout: untouched final WINDOW with the winning real config.
+    ck = configs[best_name]
+    if ck[0] == "cvar":
+        uni = build_universe(target_size=8, end_date=SELECT_END, **ck[1])
+        curve, _ = ct.walk_forward_backtest(universe_px(uni))
+    else:
+        uni = build_universe(target_size=9, end_date=SELECT_END, criterion="sharpe")
+        curve = _score_mv(universe_px(uni), list(uni), ck[1].get("relative", True))
+    holdout_m = metrics(windowed(curve))
+
+    body = (
+        "Randomized-data benchmark of the *selection process* (inspired by the 2016 "
+        "report's real-vs-random strategy search). Unlike E8's analytic Deflated "
+        "Sharpe (which assumes a fixed N_TRIALS), E9 re-runs universe + config "
+        f"selection on {n_boot} stationary block-bootstrap return panels "
+        f"(block={block} days), preserving cross-asset dependence and local vol "
+        "clustering while destroying long-horizon spurious alpha.\n\n"
+        "### Real-data selection Sharpes (pre-holdout)\n\n"
+        + "| Config | Selection Sharpe |\n|---|---|\n"
+        + "".join(f"| {n} | {s:.2f} |\n" for n, s in real_scores.items())
+        + f"\n**Selected:** `{best_name}` with selection Sharpe **{best_real:.2f}**\n\n"
+        "### Bootstrap null (best Sharpe under no-alpha)\n\n"
+        f"- Bootstrap samples with a finite best Sharpe: **{len(boot_best)}/{n_boot}**\n"
+        f"- Mean / 95th pct of best bootstrap Sharpe: "
+        f"**{np.nanmean(boot_best):.2f}** / **{p95:.2f}**\n"
+        f"- Empirical p-value P(boot best ≥ real best): **{p_value:.3f}**\n\n"
+        "A small p-value means the real selection result is extreme vs chance "
+        "searching; a large p-value means the reported edge is consistent with "
+        "overfitting from trying many rules.\n\n"
+        "### Untouched holdout (last ~1y, frozen after selection)\n\n"
+        f"| Strategy | Ann. Return | Ann. Vol | Sharpe (excess) | Max Drawdown |\n"
+        f"|---|---|---|---|---|\n"
+        f"| {best_name} (holdout) | {holdout_m['ann_ret']:.2%} | {holdout_m['ann_vol']:.2%} | "
+        f"{holdout_m['sharpe']:.2f} | {holdout_m['max_dd']:.2%} |\n"
+    )
+
+    series = {f"{best_name} (holdout)": windowed(curve)}
+    series, bm = add_benchmarks(series)
+    rows = [(f"{best_name} (holdout)", holdout_m)]
+    # Stash bootstrap summary on the metrics dict for the index.
+    out = make_report("e9_bootstrap",
+                      "E9 — Bootstrap Selection Benchmark (Real vs Random Search)",
+                      series, body, rows + bm)
+    out["_e9_meta"] = dict(
+        best_name=best_name, best_real=best_real, p_value=p_value, p95=p95,
+        n_boot=len(boot_best),
+    )
+    return out
+
+
 def write_index(all_metrics: dict):
     e1 = all_metrics["E1"]
     e3 = all_metrics["E3"]
     e4 = all_metrics["E4"]
     e6 = all_metrics["E6"]
     e8 = all_metrics["E8"]
+    e9 = all_metrics.get("E9", {})
     spy = e1["S&P 500 (SPY)"]
     dia = e1["Dow Jones (DIA)"]
+    e9_meta = e9.get("_e9_meta", {})
     lines = [
         "# Trials\n",
         "Backtests of the CVaR and mean-variance traders over the most recent ~1-year "
@@ -584,45 +765,45 @@ def write_index(all_metrics: dict):
         "only data available before the window (no lookahead). Prices are dividend/split "
         "adjusted, Sharpe ratios are **excess** of a "
         f"{RISK_FREE:.0%} risk-free rate, and equity curves are **net of "
-        f"{mv.COST_BPS:.0f} bps** per-turnover transaction costs.\n",
+        "asset-specific trading costs** (Markowitz) / "
+        f"{ct.COST_BPS:.0f} bps turnover (CVaR).\n",
         "## Key findings\n",
-        "- **The Markowitz trader was overhauled:** HMM gone; Black-Litterman returns + "
-        "Iterated-EWMA covariance + weekly rebalancing + volatility targeting "
-        "(practical Markowitz / Boyd). See E4 ablation and trials/improve_mv.py.",
+        "- **Markowitz v7:** relative Black-Litterman views (residual mean-reversion "
+        "between correlated peers) + asset-specific L1 costs (no-trade region) + "
+        "IEWMA covariance + **daily** rebalancing. See E4.",
         "- **Robustness checks (E8):** after charging costs, scoring out-of-sample across "
         f"sub-windows, and deflating for multiple testing, CVaR net {_fmt(e8['CVaR (net)'])} "
-        f"and Mean-Variance net {_fmt(e8['Mean-Variance (net)'])}. See E8 for gross-vs-net, "
-        "per-window consistency, and deflated-Sharpe detail.",
+        f"and Mean-Variance net {_fmt(e8['Mean-Variance (net)'])}.",
+        (
+            f"- **E9 bootstrap selection p-value:** {e9_meta.get('p_value', float('nan')):.3f} "
+            f"(real best `{e9_meta.get('best_name', '?')}` selection Sharpe "
+            f"{e9_meta.get('best_real', float('nan')):.2f} vs null 95th pct "
+            f"{e9_meta.get('p95', float('nan')):.2f})."
+            if e9_meta else "- **E9 bootstrap selection:** not run."
+        ),
         f"- **Benchmarks (this window):** SPY {_fmt(spy)}; DIA {_fmt(dia)}.",
-        f"- **CVaR beats both benchmarks risk-adjusted** ({_fmt(e1['CVaR (uniform/sharpe, 8)'])}) "
-        "with roughly half the drawdown of SPY.",
-        "- **Adaptive cluster allocation is the standout knob** "
+        f"- **CVaR beats both benchmarks risk-adjusted** ({_fmt(e1['CVaR (uniform/sharpe, 8)'])}).",
+        "- **Adaptive cluster allocation** "
         f"({_fmt(e3['CVaR (adaptive / sharpe)'])} vs uniform "
-        f"{_fmt(e3['CVaR (uniform / sharpe)'])}): tilting universe slots toward the "
-        "strongest-performing clusters improved return, Sharpe, and drawdown together.",
-        "- **Practical Markowitz (IEWMA + weekly) beats the legacy daily/LW stack** "
-        f"({_fmt(e4['MV practical'])} vs legacy {_fmt(e4['MV legacy'])}): "
-        "Iterated-EWMA covariance and weekly rebalancing were the largest levers "
-        "(see trials/improve_mv.py).",
-        "- **A rolling, adaptively-weighted universe is implemented** — the pool is "
-        "re-surveyed each quarter and the per-cluster weighting re-adapts to recent "
-        f"performance. In this window it **{'underperformed' if e6['CVaR rolling (adaptive)']['sharpe'] < e6['CVaR fixed']['sharpe'] else 'outperformed'}** "
-        f"the stable fixed universe (rolling-adaptive {_fmt(e6['CVaR rolling (adaptive)'])} "
-        f"vs fixed {_fmt(e6['CVaR fixed'])}): quarterly winner-chasing added turnover and "
-        "timing risk. The mechanism works; the naive momentum edge didn't pay here.",
-        "- **The CVXPYgen-compiled solver** (`fast_cvar.py`) is ~2x faster end-to-end with "
-        "bit-identical results — see E5.\n",
+        f"{_fmt(e3['CVaR (uniform / sharpe)'])}).",
+        "- **Relative BL views** "
+        f"({_fmt(e4['MV v7 relative'])} vs absolute-only {_fmt(e4['MV absolute-only'])}).",
+        "- **Rolling universe** "
+        f"{'underperformed' if e6['CVaR rolling (adaptive)']['sharpe'] < e6['CVaR fixed']['sharpe'] else 'outperformed'} "
+        f"fixed ({_fmt(e6['CVaR rolling (adaptive)'])} vs {_fmt(e6['CVaR fixed'])}).",
+        "- **CVXPYgen compiled solver** — see E5.\n",
         "## Experiments\n",
         "| Experiment | Report |",
         "|---|---|",
         "| E1 — CVaR baseline vs S&P/Dow | [e1_cvar_baseline.md](e1_cvar_baseline.md) |",
         "| E2 — Mean-Variance baseline vs S&P/Dow | [e2_mv_baseline.md](e2_mv_baseline.md) |",
         "| E3 — CVaR universe-selection variations | [e3_cvar_universe.md](e3_cvar_universe.md) |",
-        "| E4 — Mean-Variance practical vs legacy | [e4_mv_risk_correction.md](e4_mv_risk_correction.md) |",
+        "| E4 — MV relative BL vs absolute-only | [e4_mv_risk_correction.md](e4_mv_risk_correction.md) |",
         "| E5 — CVXPYgen compiled solver | [e5_fast_solver.md](e5_fast_solver.md) |",
         "| E6 — CVaR fixed vs rolling universe | [e6_cvar_rolling.md](e6_cvar_rolling.md) |",
         "| E7 — Mean-Variance fixed vs rolling universe | [e7_mv_rolling.md](e7_mv_rolling.md) |",
         "| E8 — Robustness: costs / out-of-sample / deflated Sharpe | [e8_robustness.md](e8_robustness.md) |",
+        "| E9 — Bootstrap selection benchmark | [e9_bootstrap.md](e9_bootstrap.md) |",
         "",
         "Regenerate with: `python trials/run_trials.py` (from the project root).",
         "",
@@ -646,6 +827,7 @@ def main():
     results["E6"] = exp_cvar_rolling()
     results["E7"] = exp_mv_rolling()
     results["E8"] = exp_robustness()
+    results["E9"] = exp_bootstrap_selection(n_boot=30, block=10)
     write_index(results)
     print("\nAll trials complete.")
 

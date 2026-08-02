@@ -9,8 +9,9 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
+from alpaca.common.exceptions import APIError
 
 # Total-return (splits + dividends) adjustment for fair, leak-free prices.
 try:
@@ -46,6 +47,8 @@ MAX_INVEST = 0.99
 MIN_WEIGHT_THRESHOLD = 0.01
 
 MIN_TRADE_PCT_NAV = 0.0025
+PURGE_DUST_MARKET_VALUE = 1.0
+PURGE_DUST_QTY = 1e-4  # sub-share leftovers that notional sells leave behind
 
 # Transaction costs charged in the backtest (round-trip, bps of traded notional).
 COST_BPS = 10.0
@@ -72,18 +75,69 @@ def fetch_alpaca_prices(symbols, start, end):
     px = bars["close"].unstack(level=0)
     return px.sort_index()
 
+
+def _wait_for_no_open_orders(trading_client, timeout_s=90):
+    """Poll until open orders clear (fills or cancels), or timeout."""
+    import time
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        open_orders = trading_client.get_orders(
+            GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=100)
+        )
+        if not open_orders:
+            return True
+        time.sleep(1.0)
+    return False
+
+
+def _cancel_open_orders_for_symbols(trading_client, symbols, timeout_s=20):
+    """Cancel open orders only for the given symbols (leave others alone)."""
+    import time
+    symbols = set(symbols)
+    open_orders = trading_client.get_orders(
+        GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=100)
+    )
+    victims = [o for o in open_orders if o.symbol in symbols]
+    if not victims:
+        return 0
+    print(f"Cancelling {len(victims)} open order(s) for purge symbols...")
+    for o in victims:
+        try:
+            trading_client.cancel_order_by_id(o.id)
+        except APIError as e:
+            print(f"  skip cancel {o.symbol}: {e}")
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        still = [
+            o for o in trading_client.get_orders(
+                GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=100)
+            )
+            if o.symbol in symbols
+        ]
+        if not still:
+            break
+        time.sleep(0.5)
+    return len(victims)
+
+
 def rebalance_alpaca_to_weights(target_w, current_w, notional):
     """
     Submit market orders to reach `target_w`. Also liquidates any open position
     whose symbol is absent from (or zero in) the target book — otherwise names
     that leave the rolling universe would linger forever.
+
+    Full exits sell the exact share qty (no floor) so fractional dust is not left
+    behind; partial sells still use qty sizing; buys use notional.
     """
     key = os.environ["APCA_API_KEY_ID"]
     secret = os.environ["APCA_API_SECRET_KEY"]
     trading_client = TradingClient(key, secret, paper=True)
 
     current_positions = {
-        p.symbol: float(p.market_value)
+        p.symbol: {
+            "qty": float(p.qty),
+            "market_value": float(p.market_value),
+        }
         for p in trading_client.get_all_positions()
     }
 
@@ -93,9 +147,28 @@ def rebalance_alpaca_to_weights(target_w, current_w, notional):
         full_target[sym] = float(w)
 
     for sym, tgt_w in full_target.items():
-        cur = current_positions.get(sym, 0.0)
+        position = current_positions.get(sym, {"qty": 0.0, "market_value": 0.0})
+        cur = position["market_value"]
+        qty = position["qty"]
         tgt = tgt_w * notional
         delta = tgt - cur
+
+        # Full exit: always sell exact remaining qty (even if below MIN_TRADE_PCT_NAV),
+        # otherwise notional rounding / the min-trade skip leaves immortal dust.
+        if tgt_w <= 0 and qty > 0:
+            sell_qty = math.floor(qty * 1e9) / 1e9  # Alpaca qty precision
+            if sell_qty <= 0:
+                continue
+            trading_client.submit_order(
+                MarketOrderRequest(
+                    symbol=sym,
+                    qty=sell_qty,
+                    side=OrderSide.SELL,
+                    time_in_force=TimeInForce.DAY,
+                )
+            )
+            print(f"  SELL {sym:6} qty={sell_qty:.9f} (full exit)")
+            continue
 
         if abs(delta) / max(notional, 1.0) < MIN_TRADE_PCT_NAV:
             continue
@@ -105,17 +178,124 @@ def rebalance_alpaca_to_weights(target_w, current_w, notional):
         if notional_trade < 1.0:
             continue
 
-        # Selling an entire leftover position: prefer qty close if notional rounding
-        # would leave a dust remnant, but notional orders are fine for Alpaca paper.
-        trading_client.submit_order(
-            MarketOrderRequest(
-                symbol=sym,
-                notional=notional_trade,
-                side=side,
-                time_in_force=TimeInForce.DAY,
+        if side == OrderSide.SELL:
+            px = cur / qty if qty > 0 else 0.0
+            sell_qty = abs(delta) / px if px > 0 else 0.0
+            sell_qty = min(sell_qty, qty)
+            sell_qty = math.floor(sell_qty * 1e9) / 1e9
+            if sell_qty <= 0:
+                continue
+            trading_client.submit_order(
+                MarketOrderRequest(
+                    symbol=sym,
+                    qty=sell_qty,
+                    side=OrderSide.SELL,
+                    time_in_force=TimeInForce.DAY,
+                )
             )
+            print(f"  SELL {sym:6} qty={sell_qty:.6f} (~${notional_trade:,.2f})")
+        else:
+            trading_client.submit_order(
+                MarketOrderRequest(
+                    symbol=sym,
+                    notional=notional_trade,
+                    side=OrderSide.BUY,
+                    time_in_force=TimeInForce.DAY,
+                )
+            )
+            print(f"  BUY  {sym:6} ${notional_trade:,.2f}")
+
+
+def purge_unexpected_or_dust_positions(
+    expected_symbols,
+    dust_threshold=PURGE_DUST_MARKET_VALUE,
+    dust_qty=PURGE_DUST_QTY,
+):
+    """
+    Close any open paper position that is either outside the expected symbol set
+    or too small to matter (dust).
+
+    Waits for rebalance orders to fill first. Only cancels open orders for the
+    specific symbols being purged (never nukes the whole order book).
+    """
+    import time
+
+    key = os.environ["APCA_API_KEY_ID"]
+    secret = os.environ["APCA_API_SECRET_KEY"]
+    trading_client = TradingClient(key, secret, paper=True)
+
+    print("Waiting for rebalance orders to settle...")
+    if not _wait_for_no_open_orders(trading_client, timeout_s=90):
+        print("  (timeout — proceeding; some orders may still be open off-hours)")
+
+    expected_symbols = set(expected_symbols)
+    positions = list(trading_client.get_all_positions())
+    to_purge = [
+        p for p in positions
+        if (
+            p.symbol not in expected_symbols
+            or abs(float(p.market_value)) < dust_threshold
+            or abs(float(p.qty)) < dust_qty
         )
-        print(f"  {side.value:4} {sym:6} ${notional_trade:,.2f}")
+    ]
+
+    if not to_purge:
+        print(f"No unexpected or dust positions below ${dust_threshold:.2f} were found.")
+        return
+
+    purge_syms = [p.symbol for p in to_purge]
+    _cancel_open_orders_for_symbols(trading_client, purge_syms)
+    time.sleep(1.0)
+
+    print(f"Purging {len(to_purge)} unexpected/dust position(s)...")
+    for position in to_purge:
+        sym = position.symbol
+        qty = abs(float(position.qty))
+        try:
+            trading_client.close_position(sym)
+            print(f"  closed {sym:6} qty={qty:.9f} mv=${float(position.market_value):.6f}")
+            continue
+        except APIError as e:
+            msg = str(e)
+            print(f"  close_position {sym} failed ({msg}); trying qty sell...")
+
+        try:
+            live = trading_client.get_open_position(sym)
+            avail = abs(float(live.qty))
+            if "available" in msg:
+                import json
+                try:
+                    payload = json.loads(msg[msg.find("{"): msg.rfind("}") + 1])
+                    avail = float(payload.get("available", avail))
+                except Exception:
+                    pass
+            sell_qty = math.floor(avail * 1e9) / 1e9
+            if sell_qty <= 0:
+                print(f"  skip {sym}: no available qty")
+                continue
+            trading_client.submit_order(
+                MarketOrderRequest(
+                    symbol=sym,
+                    qty=sell_qty,
+                    side=OrderSide.SELL,
+                    time_in_force=TimeInForce.DAY,
+                )
+            )
+            print(f"  SELL {sym:6} qty={sell_qty:.9f} (dust fallback)")
+        except APIError as e2:
+            print(f"  FAILED to purge {sym}: {e2}")
+
+    time.sleep(1.0)
+    remaining = list(trading_client.get_all_positions())
+    print("\nRemaining positions after purge:")
+    if not remaining:
+        print("  None")
+        return
+    for position in remaining:
+        mv = float(position.market_value)
+        q = float(position.qty)
+        flag = " [DUST-PENDING]" if abs(mv) < dust_threshold or abs(q) < dust_qty else ""
+        print(f"  {position.symbol:6} qty={q:.9f} market_value=${mv:.2f}{flag}")
 
 def detect_regime(rets, lookback=63, crash_thresh=-0.08, cvar_thresh=0.02):
     """
@@ -675,6 +855,9 @@ def main():
 
         print("\nExecuting trades...")
         rebalance_alpaca_to_weights(target_w, current_w, equity)
+        # Only keep names with a real target weight; tiny blended leftovers get purged.
+        keep = target_w[target_w >= MIN_WEIGHT_THRESHOLD].index
+        purge_unexpected_or_dust_positions(keep)
         print("Done!")
 
 if __name__ == "__main__":

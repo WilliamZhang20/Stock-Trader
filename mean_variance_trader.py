@@ -1,22 +1,16 @@
 #!/usr/bin/env python3
 """
-Version 6: practical mean-variance (Markowitz) portfolio optimization.
+Version 7: practical Markowitz with relative Black-Litterman views and
+asset-specific trading costs (no-trade region).
 
-Textbook Markowitz is unstable because a raw sample mean is a noisy return
-estimate and a flat trailing covariance misses vol dynamics. This version
-follows the "practical Markowitz" line from Boyd et al. / ENGR108:
-
-1. **Black-Litterman posterior returns** — EWMA views shrunk toward a
-   market-equilibrium prior (anti-overfitting on mu).
-2. **Iterated EWMA (IEWMA) covariance** — EWMA vols, then EWMA correlation of
-   vol-standardized returns (Engle / Barratt-Boyd). Much more responsive than
-   Ledoit-Wolf on a flat window.
-3. **Volatility targeting** — one knob (TARGET_VOL) scales gross exposure.
-4. **Weekly rebalancing + turnover penalty** — daily churn was eating
-   double-digit return under realistic cost assumptions.
-
-Tuned via trials/improve_mv.py (IEWMA + weekly + tighter caps won on both
-last-year and out-of-sample excess Sharpe).
+Key upgrades vs textbook / v6:
+1. **Black-Litterman posterior** with *relative* views from residual
+   mean-reversion between correlated peers (not just P = I absolute views).
+2. **IEWMA covariance** (Engle / Barratt-Boyd).
+3. **Asset-specific L1 costs** ``sum_i c_i |w_i - w_prev_i|`` in the QP *and*
+   the backtest — creates a genuine no-trade region so daily rebalancing no
+   longer implies daily churn.
+4. **Volatility targeting** for stable risk.
 """
 import os, argparse, math, datetime as dt
 import numpy as np
@@ -44,29 +38,38 @@ except Exception:
 
 START = "2023-01-01"
 END   = None
-REBAL_EVERY_DAYS = 5       # weekly (trading days) — daily churn was the #1 cost drag
+# Daily rebalance is fine once asset-specific costs create a no-trade region;
+# the optimizer simply skips names whose expected edge < marginal cost.
+REBAL_EVERY_DAYS = 1
 RETURN_LOOKBACK_DAYS = 252
 EWMA_HALFLIFE_DAYS = 5
 LAMBDA_RISK = 12.0
-GAMMA_TC = 0.003
-TAU_TURNOVER = 0.30
 W_MAX = 0.25
 MAX_INVEST = 0.99
 
-# Black-Litterman parameters (return-estimate shrinkage).
-BL_TAU = 0.05              # uncertainty of the equilibrium prior
-BL_DELTA = 2.5             # market risk-aversion for reverse optimization
-BL_VIEW_UNCERTAINTY = 1.0  # scales Omega; higher => trust the prior more (more shrinkage)
+# Black-Litterman parameters.
+BL_TAU = 0.05
+BL_DELTA = 2.5
+BL_VIEW_UNCERTAINTY = 1.0          # scales absolute-view Omega
+BL_REL_VIEW_UNCERTAINTY = 1.0      # base scale for relative-view Omega
+BL_REL_MAX_PAIRS = 6               # cap number of relative views
+BL_REL_MIN_CORR = 0.55             # only pair assets at least this correlated
+BL_REL_HALFLIFE = 63               # rolling window for beta / residual
+BL_REL_KAPPA = 0.25                # fraction of residual expected to mean-revert / day
 
-# IEWMA covariance half-lives (vol then correlation), Barratt-Boyd defaults.
+# IEWMA covariance half-lives.
 IEWMA_VOL_HALFLIFE = 63
 IEWMA_COR_HALFLIFE = 125
 
 # Volatility targeting.
-TARGET_VOL = 0.14          # annualized portfolio volatility target
+TARGET_VOL = 0.14
 
-# Transaction costs charged in the backtest (round-trip, bps of traded notional).
-COST_BPS = 10.0
+# Asset-specific trading costs (one-way, as a fraction of NAV per unit weight).
+# Backtest and optimizer MUST use the same c_i. Floor = BASE_COST_BPS;
+# scales with recent vol as a spread/impact proxy.
+BASE_COST_BPS = 5.0          # half-spread + fee floor (one-way)
+VOL_COST_MULT = 0.35         # extra bps ≈ VOL_COST_MULT * (ann_vol * 100)
+COST_BPS = 10.0              # legacy scalar fallback (≈ 2 * BASE for reporting)
 
 # -----------------------
 # Alpaca helpers
@@ -186,6 +189,157 @@ def estimate_cov(returns):
     """Default covariance estimator used by the live / backtest paths."""
     return iewma_cov(returns)
 
+
+def estimate_trading_costs(returns, base_bps=BASE_COST_BPS, vol_mult=VOL_COST_MULT):
+    """
+    Per-asset one-way trading cost as a fraction of NAV per unit weight change.
+
+    c_i = (base_bps + vol_mult * ann_vol_i_pct) / 1e4
+
+    Higher-vol names pay a wider effective spread / impact. Used identically in
+    the QP (``c @ |dw|``) and the equity-curve backtest so the optimizer and
+    evaluation solve the same economic problem. A properly calibrated L1 cost
+    induces a no-trade region: the solver only moves w_i when expected benefit
+    exceeds c_i.
+    """
+    # Recent realized vol (prefer last ~63d when available).
+    window = returns.tail(min(63, len(returns)))
+    ann_vol = window.std() * np.sqrt(252)
+    # ann_vol is a fraction (e.g. 0.20); convert to percent points for the mult.
+    c_bps = base_bps + vol_mult * (ann_vol * 100.0)
+    c = (c_bps / 1e4).clip(lower=base_bps / 1e4)
+    return pd.Series(c, index=returns.columns)
+
+
+def _pca_cluster_labels(returns, n_clusters=None):
+    """
+    Soft mirror of market_analyzer's PCA + KMeans grouping, applied to the
+    *current* portfolio so relative views prefer within-cluster peers.
+    """
+    from sklearn.decomposition import PCA
+    from sklearn.cluster import KMeans
+
+    R = returns.dropna(axis=1)
+    n = R.shape[1]
+    if n < 3:
+        return {s: 0 for s in returns.columns}
+    if n_clusters is None:
+        n_clusters = max(2, min(n // 2, 4))
+    n_clusters = max(1, min(n_clusters, n))
+    # Standardize columns; fall back to zeros on degenerate vols.
+    Z = R.values.astype(float)
+    mu = Z.mean(axis=0)
+    sd = Z.std(axis=0)
+    sd = np.where(sd < 1e-12, 1.0, sd)
+    Z = (Z - mu) / sd
+    n_comp = min(n_clusters, n, max(1, Z.shape[0] // 5))
+    try:
+        loadings = PCA(n_components=n_comp).fit_transform(Z.T)  # assets × factors
+        labels = KMeans(n_clusters=n_clusters, random_state=42, n_init=10).fit_predict(loadings)
+    except Exception:
+        return {s: 0 for s in returns.columns}
+    return {sym: int(lab) for sym, lab in zip(R.columns, labels)}
+
+
+def _relative_pair_views(returns, Sigma, max_pairs=BL_REL_MAX_PAIRS,
+                         min_corr=BL_REL_MIN_CORR, lookback=BL_REL_HALFLIFE,
+                         kappa=BL_REL_KAPPA):
+    """
+    Build relative Black-Litterman views from residual mean-reversion.
+
+    For correlated peers (i, j), fit r_i ≈ α + β r_j on a trailing window.
+    If the residual looks mean-reverting (AR(1) |φ| < 1 with decent fit),
+    emit a relative view P_k = e_i - β e_j with q_k = -κ * last_residual,
+    and Ω_kk large when the relationship is unstable (low R² / high resid vol).
+
+    Pair ranking prefers PCA/KMeans cluster mates (same idea as
+    ``market_analyzer`` universe construction) before raw correlation.
+
+    Returns (P, q, omega_diag) possibly empty (0 rows).
+    """
+    syms = list(returns.columns)
+    n = len(syms)
+    if n < 2 or len(returns) < max(40, lookback // 2):
+        return np.zeros((0, n)), np.zeros(0), np.zeros(0)
+
+    window = returns.tail(min(lookback, len(returns)))
+    R = window.values
+    # Correlation for pair ranking (use Sigma-implied corr when possible).
+    vol = np.sqrt(np.clip(np.diag(Sigma.values), 1e-12, None))
+    corr = Sigma.values / np.outer(vol, vol)
+    np.fill_diagonal(corr, 0.0)
+
+    cluster = _pca_cluster_labels(window)
+    # Rank pairs: intra-cluster first, then by |corr| descending.
+    pairs = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            c = abs(corr[i, j])
+            if c >= min_corr:
+                same = 1 if cluster.get(syms[i], -1) == cluster.get(syms[j], -2) else 0
+                pairs.append((same, c, i, j))
+    pairs.sort(reverse=True)
+
+    P_rows, q_list, om_list = [], [], []
+    used = set()
+    for _same, c, i, j in pairs:
+        if len(P_rows) >= max_pairs:
+            break
+        # Prefer each name in at most one relative view (keeps P well-conditioned).
+        if i in used or j in used:
+            continue
+
+        yi, yj = R[:, i], R[:, j]
+        # OLS through demeaned series: β = cov(i,j)/var(j)
+        var_j = float(np.var(yj))
+        if var_j < 1e-16:
+            continue
+        beta = float(np.cov(yi, yj, ddof=0)[0, 1] / var_j)
+        alpha = float(yi.mean() - beta * yj.mean())
+        resid = yi - alpha - beta * yj
+        # AR(1) on residual: φ = corr(e_t, e_{t-1})
+        if len(resid) < 20:
+            continue
+        e0, e1 = resid[1:], resid[:-1]
+        denom = float(np.dot(e1, e1))
+        if denom < 1e-16:
+            continue
+        phi = float(np.dot(e0, e1) / denom)
+        # Require mean-reversion (φ < 1) and not explosive negative.
+        if not (-0.2 < phi < 0.95):
+            continue
+        ss_tot = float(np.dot(yi - yi.mean(), yi - yi.mean())) + 1e-16
+        ss_res = float(np.dot(resid, resid))
+        r2 = max(0.0, 1.0 - ss_res / ss_tot)
+        if r2 < 0.15:
+            continue
+
+        # Expected relative return: residual expected to decay toward 0.
+        # q ≈ -κ * (1-φ) * e_t  (speed of mean reversion times current gap)
+        speed = max(1.0 - phi, 0.05)
+        q_k = -kappa * speed * float(resid[-1])
+
+        row = np.zeros(n)
+        row[i] = 1.0
+        row[j] = -beta
+        # View uncertainty: larger when R² is low or residual is noisy.
+        # Scale relative to prior variance of the view: row @ (τ Σ) @ row.
+        prior_var = float(row @ (BL_TAU * Sigma.values) @ row)
+        prior_var = max(prior_var, 1e-12)
+        instability = (1.0 - r2) + (ss_res / len(resid)) / (np.var(yi) + 1e-12)
+        omega_k = prior_var * BL_REL_VIEW_UNCERTAINTY * (1.0 + 3.0 * instability)
+
+        P_rows.append(row)
+        q_list.append(q_k)
+        om_list.append(omega_k)
+        used.add(i)
+        used.add(j)
+
+    if not P_rows:
+        return np.zeros((0, n)), np.zeros(0), np.zeros(0)
+    return np.asarray(P_rows), np.asarray(q_list), np.asarray(om_list)
+
+
 def black_litterman_mu(
     returns,
     Sigma,
@@ -193,54 +347,60 @@ def black_litterman_mu(
     tau=BL_TAU,
     delta=BL_DELTA,
     view_uncertainty=BL_VIEW_UNCERTAINTY,
+    use_relative_views=True,
 ):
     """
-    Black-Litterman posterior expected returns, used as `mu` for the QP.
+    Black-Litterman posterior expected returns.
 
-    The noisy EWMA/momentum estimate enters only as *views*; they are shrunk
-    toward a market-equilibrium prior obtained by reverse optimization from an
-    inverse-volatility market proxy. This dramatically reduces the estimation
-    error that makes plain Markowitz overfit.
+    Combines:
+      - absolute EWMA views (P_abs = I) shrunk hard toward equilibrium, and
+      - relative residual-mean-reversion views between correlated peers
+        (P_rel rows = e_i - β e_j), with Ω inflated when the link is unstable.
 
-    Wires in the standalone `black_litterman.py` module. That helper builds its
-    internal prior as ``pi = tau * Sigma @ w_mkt``; we pre-scale the market
-    weights by ``delta / tau`` so the effective prior is the standard
-    reverse-optimization equilibrium ``pi = delta * Sigma @ w_mkt``.
+    The relative block is the architectural upgrade suggested by the 2016
+    correlation-divergence study, mapped into the existing BL + long-only QP
+    (tilts, not market-neutral pairs).
     """
     syms = list(returns.columns)
     n = len(syms)
     Sig = Sigma.values
 
-    # Inverse-volatility market proxy (normalized to sum to 1).
     vol = np.sqrt(np.clip(np.diag(Sig), 1e-12, None))
     w_mkt = 1.0 / vol
     w_mkt = w_mkt / w_mkt.sum()
     w_mkt_scaled = w_mkt * (delta / tau)
 
-    # One view per asset: its EWMA/momentum expected return.
-    q = exp_weighted_mean_returns(returns, halflife_days).values
-    P = np.eye(n)
+    # Absolute views (shrunk).
+    q_abs = exp_weighted_mean_returns(returns, halflife_days).values
+    P_abs = np.eye(n)
+    om_abs = np.clip(np.diag(P_abs @ (tau * Sig) @ P_abs.T), 1e-12, None) * view_uncertainty
 
-    # He-Litterman view uncertainty: proportional to prior variance of each view.
-    omega_diag = np.clip(np.diag(P @ (tau * Sig) @ P.T), 1e-12, None) * view_uncertainty
-    Omega = np.diag(omega_diag)
+    if use_relative_views:
+        P_rel, q_rel, om_rel = _relative_pair_views(returns, Sigma)
+    else:
+        P_rel = np.zeros((0, n))
+        q_rel = np.zeros(0)
+        om_rel = np.zeros(0)
+
+    if len(q_rel) > 0:
+        P = np.vstack([P_abs, P_rel])
+        q = np.concatenate([q_abs, q_rel])
+        Omega = np.diag(np.concatenate([om_abs, om_rel]))
+    else:
+        P, q, Omega = P_abs, q_abs, np.diag(om_abs)
 
     try:
         pi_bl = black_litterman_posterior(Sig, w_mkt_scaled, P, q, Omega, tau=tau)
     except np.linalg.LinAlgError:
-        pi_bl = q  # singular posterior -> fall back to the raw views
+        pi_bl = q_abs
     return pd.Series(np.asarray(pi_bl).reshape(-1), index=syms)
+
 
 # -----------------------
 # Optimizer
 # -----------------------
 def _apply_vol_target(w, Sigma, target_vol, max_invest, w_max):
-    """
-    Scale gross exposure so the forecast annualized portfolio volatility hits
-    `target_vol`, never breaching the budget (`max_invest`) or per-name (`w_max`)
-    caps. This is the transparent replacement for the old HMM risk multipliers:
-    lever toward the caps when markets are calm, hold cash when they are volatile.
-    """
+    """Scale gross exposure toward `target_vol` without breaching caps."""
     wv = w.values
     var = float(wv @ Sigma.values @ wv)
     ann_vol = math.sqrt(max(var, 0.0)) * math.sqrt(252)
@@ -255,34 +415,50 @@ def _apply_vol_target(w, Sigma, target_vol, max_invest, w_max):
         s = min(s, w_max / mx)
     return w * max(s, 0.0)
 
+
 def solve_portfolio(
     mu,
     Sigma,
     w_prev=None,
+    costs=None,
     max_invest_fraction=MAX_INVEST,
     lambda_risk=LAMBDA_RISK,
     target_vol=TARGET_VOL,
 ):
     """
-    Solve mean-variance portfolio with turnover regularization (least-squares
-    risk term), then apply volatility targeting to the solution.
+    Mean-variance QP with asset-specific turnover costs:
+
+        max  mu'w - λ ||L'w||^2 - c'|w - w_prev|
+
+    The vector cost ``c`` (from ``estimate_trading_costs``) creates a no-trade
+    region: a weight only moves when its expected benefit exceeds its marginal
+    trading cost — the Boyd / 2016-report "do nothing" zone, without a
+    hand-tuned hard turnover cap.
     """
     n = len(mu)
     w = cp.Variable(n)
-
-    L = np.linalg.cholesky(Sigma.values + 1e-8 * np.eye(n))  # jitter for numerical stability
-
-    obj = mu.values @ w - lambda_risk * cp.sum_squares(L.T @ w)
-
-    constraints = [cp.sum(w) <= max_invest_fraction,
-                   w >= 0,
-                   w <= W_MAX]
+    L = np.linalg.cholesky(Sigma.values + 1e-8 * np.eye(n))
 
     if w_prev is None:
         w_prev = np.zeros(n)
-    turnover = cp.norm1(w - w_prev)
-    obj = obj - GAMMA_TC * turnover
-    constraints.append(turnover <= TAU_TURNOVER)
+    else:
+        w_prev = np.asarray(w_prev, dtype=float).reshape(-1)
+
+    if costs is None:
+        costs = np.full(n, BASE_COST_BPS / 1e4)
+    else:
+        costs = np.asarray(costs, dtype=float).reshape(-1)
+
+    obj = (
+        mu.values @ w
+        - lambda_risk * cp.sum_squares(L.T @ w)
+        - costs @ cp.abs(w - w_prev)
+    )
+    constraints = [
+        cp.sum(w) <= max_invest_fraction,
+        w >= 0,
+        w <= W_MAX,
+    ]
 
     prob = cp.Problem(cp.Maximize(obj), constraints)
     prob.solve(solver=cp.OSQP, verbose=False, max_iter=10000)
@@ -290,7 +466,10 @@ def solve_portfolio(
     if prob.status not in ["optimal", "optimal_inaccurate"]:
         print(f"Optimizer warning: {prob.status}")
 
-    w_opt = pd.Series(np.clip(w.value if w.value is not None else np.zeros(n), 0, 1), index=mu.index)
+    w_opt = pd.Series(
+        np.clip(w.value if w.value is not None else np.zeros(n), 0, 1),
+        index=mu.index,
+    )
     total_alloc = w_opt.sum()
     if total_alloc > max_invest_fraction:
         w_opt = w_opt * (max_invest_fraction / total_alloc)
@@ -300,6 +479,17 @@ def solve_portfolio(
 
     return w_opt
 
+
+def _apply_trade_costs(equity, w_new, w_old, costs):
+    """Deduct asset-specific costs from equity: equity *= 1 - sum c_i |dw_i|."""
+    dw = (w_new - w_old).abs()
+    c = costs.reindex(dw.index).fillna(BASE_COST_BPS / 1e4)
+    drag = float((c * dw).sum())
+    if drag > 0:
+        equity *= (1.0 - drag)
+    return equity
+
+
 # Run Backtest
 def walk_forward_backtest(px):
     rets = px.pct_change().dropna()
@@ -307,28 +497,28 @@ def walk_forward_backtest(px):
 
     w_prev = None
     current_w = pd.Series(0.0, index=px.columns)
-    held_w = pd.Series(0.0, index=px.columns)   # weights held into each day (for cost accounting)
+    held_w = pd.Series(0.0, index=px.columns)
     equity = 1.0
     equity_curve = []
     weights_record = {}
     last_rebal = -10 ** 9
+    costs = pd.Series(BASE_COST_BPS / 1e4, index=px.columns)
 
     for t_idx, today in enumerate(dates):
         if t_idx >= RETURN_LOOKBACK_DAYS and (t_idx - last_rebal) >= REBAL_EVERY_DAYS:
-            # No lookahead: trade using only returns STRICTLY before `today`.
             window = rets.iloc[t_idx - RETURN_LOOKBACK_DAYS:t_idx]
             assert window.index[-1] < today, "lookahead: window must end before the trade day"
             Sigma = estimate_cov(window)
             mu = black_litterman_mu(window, Sigma)
-            current_w = solve_portfolio(mu, Sigma, w_prev, lambda_risk=LAMBDA_RISK)
+            costs = estimate_trading_costs(window)
+            current_w = solve_portfolio(
+                mu, Sigma, w_prev, costs=costs.values, lambda_risk=LAMBDA_RISK,
+            )
             weights_record[today] = current_w
             w_prev = current_w.values.copy()
             last_rebal = t_idx
 
-        # Charge transaction costs on the change from yesterday's held weights.
-        turnover = float((current_w - held_w).abs().sum())
-        if turnover > 0:
-            equity *= (1.0 - COST_BPS / 1e4 * turnover)
+        equity = _apply_trade_costs(equity, current_w, held_w, costs)
 
         if t_idx > 0:
             day_ret = float((rets.iloc[t_idx] * current_w).sum())
@@ -366,6 +556,7 @@ def walk_forward_backtest_dynamic(
 
     w = pd.Series(0.0, index=pool_px.columns)
     held_w = pd.Series(0.0, index=pool_px.columns)
+    costs = pd.Series(BASE_COST_BPS / 1e4, index=pool_px.columns)
     universe = None
     last_uni_refresh = -10 ** 9
     last_rebal = -10 ** 9
@@ -393,16 +584,20 @@ def walk_forward_backtest_dynamic(
                 window = rets.iloc[t_idx - RETURN_LOOKBACK_DAYS:t_idx][universe]
                 Sigma = estimate_cov(window)
                 mu = black_litterman_mu(window, Sigma)
-                cur = solve_portfolio(mu, Sigma, w_prev=w[universe].values, lambda_risk=lambda_risk)
+                costs_u = estimate_trading_costs(window)
+                cur = solve_portfolio(
+                    mu, Sigma, w_prev=w[universe].values,
+                    costs=costs_u.values, lambda_risk=lambda_risk,
+                )
 
                 w = pd.Series(0.0, index=pool_px.columns)
                 w[universe] = cur.values
+                costs = pd.Series(BASE_COST_BPS / 1e4, index=pool_px.columns)
+                costs[universe] = costs_u.values
                 weights_record[today] = w.copy()
                 last_rebal = t_idx
 
-        turnover = float((w - held_w).abs().sum())
-        if turnover > 0:
-            equity *= (1.0 - COST_BPS / 1e4 * turnover)
+        equity = _apply_trade_costs(equity, w, held_w, costs)
 
         if t_idx > 0 and w.sum() > 0:
             equity *= 1.0 + float((rets.iloc[t_idx] * w).sum())
@@ -450,7 +645,7 @@ def main():
         running_max = curve.cummax()
         drawdown = (curve - running_max) / running_max
         max_drawdown = drawdown.min()
-        print(f"Backtest (net of {COST_BPS:.0f}bps costs): Return {ann_ret:.2%}, "
+        print(f"Backtest (asset-specific costs, daily rebal): Return {ann_ret:.2%}, "
               f"Volatility {ann_vol:.2%}, Sharpe {sharpe:.2f}, Max Drawdown {max_drawdown:.2%}")
 
     if args.paper:
@@ -467,8 +662,13 @@ def main():
 
         Sigma = estimate_cov(window)
         mu = black_litterman_mu(window, Sigma)
-        w = solve_portfolio(mu, Sigma, w_prev=current_w.values, lambda_risk=LAMBDA_RISK)
+        costs = estimate_trading_costs(window)
+        w = solve_portfolio(
+            mu, Sigma, w_prev=current_w.values,
+            costs=costs.values, lambda_risk=LAMBDA_RISK,
+        )
         print("Target weights:\n", w.round(4))
+        print("Per-asset one-way costs (bps):\n", (costs * 1e4).round(2))
         rebalance_alpaca_to_weights(w, notional=equity)
 
 if __name__ == "__main__":
